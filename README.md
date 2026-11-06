@@ -55,7 +55,58 @@ screenshot.
 the fields as a Slack message. The request runs on a worker thread, so a slow
 connection does not freeze the window. The status line reports the outcome:
 `Indmeldelse sendt til Slack.`, `Slack svarede HTTP <code>`, or a WinINet
-error code such as `Kunne ikke sende til Slack. Fejl 12175`.
+error code such as `Kunne ikke sende til Slack. Fejl 12175`. When Slack
+rejects the message its reply is shown too, for example
+`Slack svarede HTTP 400: invalid_payload`.
+
+### Form state
+
+The window has three states, which control what can be edited:
+
+- **Editing** — the initial state; every field and button is enabled.
+- **Sending** — started by confirming the prompt. All fields, both membership
+  options and both buttons are disabled, the send button reads `Sender ...`,
+  and the title bar reads `hal9k - Indmeldelse (sender)`.
+- **Sent** — reached only on success. The form stays disabled on purpose:
+  there is nothing left to resend, and the button reads `Sendt til Slack`
+  while the title bar reads `(sendt)`. Close the window when done.
+
+A failed attempt returns the form to **editing** with the values intact, so
+the same details can be sent again after fixing the configuration or the
+connection. The result dialog repeats the delivery time, name and email, or
+the failure reason.
+
+### Testing locally
+
+`tools/fake-slack-webhook.py` is a dependency-free stand-in for a webhook: it
+accepts the POST, prints the signup in the terminal, and lists received
+signups at the same address in a browser.
+
+```sh
+python3 tools/fake-slack-webhook.py --port 8765
+```
+
+```ini
+[slack]
+url=http://127.0.0.1:8765/hook
+```
+
+Then open `http://127.0.0.1:8765/` to see the submissions. Nothing leaves the
+machine, so this is the safe way to try the send path and the form states.
+
+### Prefilled test data
+
+Start the form with the fields already filled in:
+
+```sh
+hal9k.exe --test-data
+```
+
+`--test-data` (also `-test-data` or `/test-data`) fills every field with sample
+data that passes validation, including Danish characters, a message and a
+membership choice, so the send path can be exercised without typing. Nothing is
+sent automatically: the usual confirmation still applies, and the status line
+notes that test data was loaded.
 
 ### Windows 98 and TLS
 

@@ -25,6 +25,15 @@ static HINSTANCE instance;
 static HFONT font;
 static HWND fields[8], status_text;
 static HWND main_window, send_button, message_field;
+static HWND check_button, ordinary_button, student_button;
+
+/* The form is a small state machine: fields are editable only while
+   editing; a send disables everything, a failure returns to editing, and a
+   successful send stays disabled because there is nothing left to resend. */
+#define STATE_EDITING 0
+#define STATE_SENDING 1
+#define STATE_SENT 2
+static int form_state = STATE_EDITING;
 
 /* Classic mnemonic shortcuts: Alt+<letter> moves focus to the matching field.
    The ampersand inserted into each label produces the underlined letter. */
@@ -96,6 +105,7 @@ static BOOL handle_mnemonic(HWND window, const MSG *message)
     char key;
     int i;
     if (message->message != WM_SYSKEYDOWN) return FALSE;
+    if (form_state != STATE_EDITING) return FALSE;
     if (message->hwnd != window && !IsChild(window, message->hwnd)) return FALSE;
     if (message->wParam > 0xFF) return FALSE;
     /* Ignore AltGr combinations, which are reported as Ctrl+Alt. */
@@ -158,6 +168,123 @@ static int check_form(void)
     }
     SetWindowTextA(status_text, "Felter kontrolleret. Klar til afsendelse.");
     return 1;
+}
+
+/* WinMainCRTStartup has no argv, so the command line is read directly.
+   --test-data (also -test-data, /test-data, --testdata) prefills the form. */
+static int option_matches(const char *start, int length, const char *name)
+{
+    int skip = 0, i, name_length = lstrlenA(name);
+    if (length > 0 && (start[0] == '-' || start[0] == '/')) skip = 1;
+    if (length > skip && start[skip] == '-') ++skip;
+    if (length - skip != name_length) return 0;
+    for (i = 0; i < name_length; ++i) {
+        char c = start[skip + i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != name[i]) return 0;
+    }
+    return 1;
+}
+
+static int has_test_data_option(void)
+{
+    const char *p = GetCommandLineA();
+    const char *start;
+    int length;
+    if (*p == '"') {
+        ++p;
+        while (*p && *p != '"') ++p;
+        if (*p == '"') ++p;
+    } else {
+        while (*p && *p != ' ' && *p != '\t') ++p;
+    }
+    while (*p) {
+        while (*p == ' ' || *p == '\t') ++p;
+        if (!*p) break;
+        if (*p == '"') {
+            ++p;
+            start = p;
+            while (*p && *p != '"') ++p;
+        } else {
+            start = p;
+            while (*p && *p != ' ' && *p != '\t') ++p;
+        }
+        length = (int)(p - start);
+        if (option_matches(start, length, "test-data") ||
+            option_matches(start, length, "testdata")) return 1;
+        if (*p == '"') ++p;
+    }
+    return 0;
+}
+
+static void format_time(char *out, int size)
+{
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    out[0] = (char)('0' + (now.wHour / 10) % 10);
+    out[1] = (char)('0' + now.wHour % 10);
+    out[2] = ':';
+    out[3] = (char)('0' + (now.wMinute / 10) % 10);
+    out[4] = (char)('0' + now.wMinute % 10);
+    out[5] = '\0';
+    (void)size;
+}
+
+static void apply_state(int state, const char *status)
+{
+    HWND focus = GetFocus();
+    BOOL editing = (state == STATE_EDITING);
+    int i;
+    form_state = state;
+    if (!editing && focus && (focus == main_window || IsChild(main_window, focus)))
+        SetFocus(main_window);
+    for (i = 0; i < 8; ++i) EnableWindow(fields[i], editing);
+    EnableWindow(message_field, editing);
+    EnableWindow(ordinary_button, editing);
+    EnableWindow(student_button, editing);
+    EnableWindow(check_button, editing);
+    EnableWindow(send_button, editing);
+    SetWindowTextA(send_button, state == STATE_SENDING ? "Sender ..." :
+        state == STATE_SENT ? "Sendt til Slack" : "Send indmeldelse");
+    SetWindowTextA(main_window, state == STATE_SENDING ? "hal9k - Indmeldelse (sender)" :
+        state == STATE_SENT ? "hal9k - Indmeldelse (sendt)" : "hal9k - Indmeldelse");
+    if (status) SetWindowTextA(status_text, status);
+}
+
+/* Sample data for the --test-data option: valid input that can be submitted
+   unchanged, including Danish characters to exercise the payload encoding. */
+static void prefill_test_data(void)
+{
+    static const char *values[8] = {
+        "Anna", "Hansen", "anna@example.dk", "Testvej 1",
+        "2100", "K\370benhavn \330", "01-02-1990", "12345678"
+    };
+    int i;
+    for (i = 0; i < 8; ++i) SetWindowTextA(fields[i], values[i]);
+    SetWindowTextA(message_field, "Testbesked med \346\370\345 fra kommandolinjen.");
+    apply_state(STATE_EDITING, "Testdata indl\346st. Kontroller og send.");
+    SendMessageA(ordinary_button, BM_SETCHECK, BST_CHECKED, 0);
+}
+
+/* After a successful send the form is frozen, so the dialog repeats what was
+   delivered and when. */
+static void show_sent_dialog(void)
+{
+    char first[260], last[260], email[260], time_text[8], text[1024];
+    GetWindowTextA(fields[0], first, sizeof(first));
+    GetWindowTextA(fields[1], last, sizeof(last));
+    GetWindowTextA(fields[2], email, sizeof(email));
+    format_time(time_text, sizeof(time_text));
+    lstrcpyA(text, "Indmeldelsen er sendt til Slack kl. ");
+    lstrcatA(text, time_text);
+    lstrcatA(text, ".\n\nNavn: ");
+    lstrcatA(text, first);
+    lstrcatA(text, " ");
+    lstrcatA(text, last);
+    lstrcatA(text, "\nEmail: ");
+    lstrcatA(text, email);
+    lstrcatA(text, "\n\nOplysningerne kan ikke sendes igen. Luk vinduet.");
+    MessageBoxA(main_window, text, "Indmeldelse sendt", MB_OK | MB_ICONINFORMATION);
 }
 
 /* --- Slack webhook -------------------------------------------------------
@@ -371,9 +498,40 @@ static int split_url(const char *url, char *host, int host_size,
     return 1;
 }
 
+static void read_response_body(HINTERNET request, char *out, int size)
+{
+    DWORD read = 0;
+    int total = 0;
+    out[0] = '\0';
+    while (total < size - 1 &&
+           InternetReadFile(request, out + total, (DWORD)(size - 1 - total), &read) &&
+           read > 0)
+        total += (int)read;
+    out[total] = '\0';
+}
+
+/* Slack answers errors with a short token such as invalid_payload, but a
+   proxy may answer with HTML, so keep only printable characters. */
+static void keep_printable(char *text)
+{
+    int input, output = 0, spaced = 0;
+    for (input = 0; text[input]; ++input) {
+        unsigned char byte = (unsigned char)text[input];
+        if (byte >= 0x20 && byte < 0x7F) {
+            text[output++] = (char)byte;
+            spaced = 0;
+        } else if (!spaced && output > 0) {
+            text[output++] = ' ';
+            spaced = 1;
+        }
+    }
+    while (output > 0 && text[output - 1] == ' ') --output;
+    text[output] = '\0';
+}
+
 static int post_to_slack(void)
 {
-    char host[HOST_MAX], path[URL_PATH_MAX];
+    char host[HOST_MAX], path[URL_PATH_MAX], body[81];
     unsigned short port = 0;
     int secure = 0, ok = 0;
     DWORD flags, status = 0, size = sizeof(status);
@@ -417,8 +575,16 @@ static int post_to_slack(void)
     if (status == 200) {
         lstrcpyA(result_text, "Indmeldelse sendt til Slack.");
         ok = 1;
+    } else if (status == 0) {
+        lstrcpyA(result_text, "Ukendt svar fra Slack. Intet blev sendt.");
     } else {
         set_result_number("Slack svarede HTTP ", status);
+        read_response_body(request, body, sizeof(body));
+        keep_printable(body);
+        if (body[0]) {
+            lstrcatA(result_text, ": ");
+            lstrcatA(result_text, body);
+        }
     }
 done:
     if (request) InternetCloseHandle(request);
@@ -478,12 +644,10 @@ static void start_send(void)
         return;
     }
     lstrcpyA(result_text, "Ingen afsendelse gennemf\370rt.");
-    SetWindowTextA(status_text, "Sender indmeldelse ...");
-    EnableWindow(send_button, FALSE);
+    apply_state(STATE_SENDING, "Sender indmeldelse til Slack ...");
     thread = CreateThread(NULL, 0, send_thread, NULL, 0, &thread_id);
     if (!thread) {
-        EnableWindow(send_button, TRUE);
-        SetWindowTextA(status_text, "Kunne ikke starte afsendelsen.");
+        apply_state(STATE_EDITING, "Kunne ikke starte afsendelsen.");
         return;
     }
     CloseHandle(thread);
@@ -497,7 +661,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
         char text[64];
         main_window = window;
         font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        add_control(window, "STATIC", "Indmeldelse - offline demo", 0, 0,
+        add_control(window, "STATIC", "Indmeldelse til hal9k", 0, 0,
             20, 20, 550, 18, 0, font);
         add_control(window, "STATIC", "Udfyld dine oplysninger. Felter med * er obligatoriske.", 0, 0,
             20, 55, 550, 18, 0, font);
@@ -513,14 +677,14 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
 
         add_control(window, "STATIC", "Medlemsskab *", 0, 0, 20, 261, 200, 16, 0, font);
         label_with_mnemonic("Almindeligt medlem", 'A', text, sizeof(text));
-        control = add_control(window, "BUTTON", text,
+        ordinary_button = add_control(window, "BUTTON", text,
             WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON, 0, 20, 279, 200, 22, ID_ORDINARY, font);
-        SendMessageA(control, BM_SETCHECK, BST_CHECKED, 0);
-        add_mnemonic('A', control, TRUE);
+        SendMessageA(ordinary_button, BM_SETCHECK, BST_CHECKED, 0);
+        add_mnemonic('A', ordinary_button, TRUE);
         label_with_mnemonic("Studiemedlem", 'S', text, sizeof(text));
-        control = add_control(window, "BUTTON", text, WS_TABSTOP | BS_AUTORADIOBUTTON,
-            0, 230, 279, 160, 22, ID_STUDENT, font);
-        add_mnemonic('S', control, TRUE);
+        student_button = add_control(window, "BUTTON", text,
+            WS_TABSTOP | BS_AUTORADIOBUTTON, 0, 230, 279, 160, 22, ID_STUDENT, font);
+        add_mnemonic('S', student_button, TRUE);
         label_with_mnemonic("Evt. besked / valgfrit", 'K', text, sizeof(text));
         add_control(window, "STATIC", text, 0, 0, 20, 305, 300, 16, 0, font);
         control = add_control(window, "EDIT", "", WS_TABSTOP | WS_GROUP | WS_VSCROLL |
@@ -529,19 +693,21 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
         SendMessageA(control, EM_SETLIMITTEXT, 1000, 0);
         add_mnemonic('K', control, FALSE);
         message_field = control;
-        add_control(window, "BUTTON", "Kontroller felter", WS_TABSTOP | BS_PUSHBUTTON,
-            0, 20, 380, 140, 27, ID_CHECK, font);
+        check_button = add_control(window, "BUTTON", "Kontroller felter",
+            WS_TABSTOP | BS_PUSHBUTTON, 0, 20, 376, 140, 27, ID_CHECK, font);
         send_button = add_control(window, "BUTTON", "Send indmeldelse",
-            WS_TABSTOP | BS_PUSHBUTTON, 0, 170, 380, 140, 27, ID_SEND, font);
+            WS_TABSTOP | BS_PUSHBUTTON, 0, 170, 376, 140, 27, ID_SEND, font);
         add_control(window, "STATIC", "Data sendes kun efter bekr\346ftelse.", 0, 0,
-            325, 386, 260, 18, 0, font);
-        status_text = add_control(window, "STATIC",
-            "Ingen oplysninger sendes uden bekr\346ftelse.", 0, 0, 20, 414, 560, 20, 0, font);
+            325, 382, 260, 18, 0, font);
+        status_text = add_control(window, "STATIC", "", 0, 0, 20, 406, 560, 34, 0, font);
+        apply_state(STATE_EDITING, "Ingen oplysninger sendes uden bekr\346ftelse.");
+        if (has_test_data_option()) prefill_test_data();
         SetFocus(fields[0]);
         return 0;
     }
     case WM_COMMAND:
         if (HIWORD(wparam) != BN_CLICKED) break;
+        if (form_state != STATE_EDITING) break;
         if (LOWORD(wparam) == ID_CHECK) {
             check_form();
             return 0;
@@ -552,8 +718,23 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
         }
         break;
     case WM_APP_SEND_DONE:
-        SetWindowTextA(status_text, result_text);
-        EnableWindow(send_button, TRUE);
+        if (wparam) {
+            char time_text[8], line[96];
+            format_time(time_text, sizeof(time_text));
+            lstrcpyA(line, "Indmeldelse sendt til Slack kl. ");
+            lstrcatA(line, time_text);
+            lstrcatA(line, ". Luk vinduet.");
+            apply_state(STATE_SENT, line);
+            show_sent_dialog();
+        } else {
+            char text[400];
+            lstrcpyA(text, result_text);
+            lstrcatA(text, "\n\nOplysningerne er stadig i formularen."
+                " Kontroller HAL9K.INI og pr\370v igen.");
+            apply_state(STATE_EDITING, result_text);
+            MessageBoxA(main_window, text, "Afsendelsen mislykkedes",
+                MB_OK | MB_ICONWARNING);
+        }
         return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -576,7 +757,7 @@ void WINAPI WinMainCRTStartup(void)
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = "HAL9KWindow";
     if (!RegisterClassA(&wc)) ExitProcess(1);
-    window = CreateWindowExA(0, wc.lpszClassName, "hal9k - Indmeldelse (offline demo)",
+    window = CreateWindowExA(0, wc.lpszClassName, "hal9k - Indmeldelse",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 610, 475, NULL, NULL, instance, NULL);
     if (!window) ExitProcess(1);

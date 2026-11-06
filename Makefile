@@ -1,7 +1,7 @@
 CC = i686-w64-mingw32-gcc
 WINDRES = i686-w64-mingw32-windres
 CFLAGS = -Os -Wall -Wextra -march=i386
-LDFLAGS = -mwindows -nostdlib -Wl,-e,_WinMainCRTStartup@0 -Wl,--disable-dynamicbase -Wl,--disable-nxcompat
+LDFLAGS = -mwindows -nostdlib -Wl,--disable-auto-import -Wl,-e,_WinMainCRTStartup@0 -Wl,--disable-dynamicbase -Wl,--disable-nxcompat
 
 .PHONY: all clean
 all: hal9k.exe

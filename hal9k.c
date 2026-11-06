@@ -14,8 +14,9 @@
 #define ID_ORDINARY 108
 #define ID_STUDENT 109
 #define ID_MESSAGE 110
-#define ID_CHECK 111
-#define ID_SEND 112
+#define ID_BACK 111
+#define ID_NEXT 112
+#define ID_CANCEL 113
 
 /* Posted by the send thread once the webhook request has finished. */
 #define WM_APP_SEND_DONE (WM_APP + 1)
@@ -23,9 +24,18 @@
 /* Danish strings are encoded explicitly as Windows-1252 for Windows 98. */
 static HINSTANCE instance;
 static HFONT font;
-static HWND fields[8], status_text;
-static HWND main_window, send_button, message_field;
-static HWND check_button, ordinary_button, student_button;
+static HWND fields[8], field_labels[8], status_text;
+static HWND main_window, message_field;
+static HWND ordinary_button, student_button;
+static HWND page_title, page_subtitle, intro_text;
+static HWND member_label, member_help, message_label;
+static HWND back_button, next_button, cancel_button;
+static HFONT header_font;
+
+static void show_page(int page);
+static void sync_controls(const char *status);
+static int check_form(void);
+static void start_send(void);
 
 /* The form is a small state machine: fields are editable only while
    editing; a send disables everything, a failure returns to editing, and a
@@ -34,6 +44,13 @@ static HWND check_button, ordinary_button, student_button;
 #define STATE_SENDING 1
 #define STATE_SENT 2
 static int form_state = STATE_EDITING;
+
+/* Classic wizard: one page of controls is visible at a time. */
+#define PAGE_INTRO 1
+#define PAGE_PERSONAL 2
+#define PAGE_MEMBER 3
+#define PAGE_MESSAGE 4
+static int current_page = PAGE_INTRO;
 
 /* Classic mnemonic shortcuts: Alt+<letter> moves focus to the matching field.
    The ampersand inserted into each label produces the underlined letter. */
@@ -85,12 +102,12 @@ static HWND add_control(HWND parent, const char *class_name, const char *text,
 }
 
 static HWND add_field(HWND parent, const char *label, char mnemonic, int x, int y,
-                      int width, int id, int limit)
+                      int width, int id, int limit, HWND *label_out)
 {
     char text[64];
     HWND edit;
     label_with_mnemonic(label, mnemonic, text, sizeof(text));
-    add_control(parent, "STATIC", text, 0, 0, x, y, width, 16, 0, font);
+    *label_out = add_control(parent, "STATIC", text, 0, 0, x, y, width, 16, 0, font);
     edit = add_control(parent, "EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL,
         WS_EX_CLIENTEDGE, x, y + 17, width, 23, id, font);
     SendMessageA(edit, EM_SETLIMITTEXT, limit, 0);
@@ -113,6 +130,7 @@ static BOOL handle_mnemonic(HWND window, const MSG *message)
     key = upper_ascii((char)message->wParam);
     for (i = 0; i < mnemonic_count; ++i) {
         if (mnemonics[i].key != key) continue;
+        if (!IsWindowVisible(mnemonics[i].control)) continue;
         if (mnemonics[i].activate)
             SendMessageA(mnemonics[i].control, BM_CLICK, 0, 0);
         SetFocus(mnemonics[i].control);
@@ -136,6 +154,7 @@ static int check_form(void)
     for (i = 0; i < 8; ++i) {
         GetWindowTextA(fields[i], value, sizeof(value));
         if (!value[0]) {
+            show_page(PAGE_PERSONAL);
             SetWindowTextA(status_text, "Udfyld alle obligatoriske felter (*).");
             SetFocus(fields[i]);
             return 0;
@@ -149,12 +168,14 @@ static int check_form(void)
         else if (has_at && value[i] != ' ') has_domain = 1;
     }
     if (!has_at || !has_domain) {
+        show_page(PAGE_PERSONAL);
         SetWindowTextA(status_text, "Kontroller din emailadresse.");
         SetFocus(fields[2]);
         return 0;
     }
     GetWindowTextA(fields[4], value, sizeof(value));
     if (lstrlenA(value) != 4 || !digits(value, 4)) {
+        show_page(PAGE_PERSONAL);
         SetWindowTextA(status_text, "Postnummer skal best\345 af fire cifre.");
         SetFocus(fields[4]);
         return 0;
@@ -162,11 +183,11 @@ static int check_form(void)
     GetWindowTextA(fields[6], value, sizeof(value));
     if (lstrlenA(value) != 10 || value[2] != '-' || value[5] != '-' ||
         !digits(value, 2) || !digits(value + 3, 2) || !digits(value + 6, 4)) {
+        show_page(PAGE_PERSONAL);
         SetWindowTextA(status_text, "Brug formatet dd-mm-yyyy til f\370dselsdato.");
         SetFocus(fields[6]);
         return 0;
     }
-    SetWindowTextA(status_text, "Felter kontrolleret. Klar til afsendelse.");
     return 1;
 }
 
@@ -230,27 +251,108 @@ static void format_time(char *out, int size)
     (void)size;
 }
 
-static void apply_state(int state, const char *status)
+static const char *page_titles[4] = {
+    "Velkommen til hal9k",
+    "Personlige oplysninger",
+    "Medlemskab",
+    "Valgfri besked"
+};
+
+static const char *page_subtitles[4] = {
+    "Indmeldelsen best\345r af fire korte trin. Intet sendes, f\370r du bekr\346fter p\345 den sidste side.",
+    "Udfyld navn, adresse og kontaktoplysninger. Felter med * er obligatoriske.",
+    "V\346lg den type medlemsskab, du \370nsker.",
+    "Beskeden er valgfri. N\345r du trykker Send indmeldelse, sendes oplysningerne til foreningen efter din bekr\346ftelse."
+};
+
+/* Everything that depends on state and page lives here, so the two can never
+   disagree: a control is usable only while editing and only on its page. */
+static void sync_controls(const char *status)
 {
-    HWND focus = GetFocus();
-    BOOL editing = (state == STATE_EDITING);
+    BOOL editing = (form_state == STATE_EDITING);
     int i;
-    form_state = state;
-    if (!editing && focus && (focus == main_window || IsChild(main_window, focus)))
-        SetFocus(main_window);
     for (i = 0; i < 8; ++i) EnableWindow(fields[i], editing);
-    EnableWindow(message_field, editing);
     EnableWindow(ordinary_button, editing);
     EnableWindow(student_button, editing);
-    EnableWindow(check_button, editing);
-    EnableWindow(send_button, editing);
-    SetWindowTextA(send_button, state == STATE_SENDING ? "Sender ..." :
-        state == STATE_SENT ? "Sendt til Slack" : "Send indmeldelse");
-    SetWindowTextA(main_window, state == STATE_SENDING ? "hal9k - Indmeldelse (sender)" :
-        state == STATE_SENT ? "hal9k - Indmeldelse (sendt)" : "hal9k - Indmeldelse");
+    EnableWindow(message_field, editing);
+    EnableWindow(back_button, editing && current_page > PAGE_INTRO);
+    EnableWindow(next_button, editing);
+    /* Cancel stays available while sending so a stuck request cannot trap
+       the user; after success it becomes the way to close the window. */
+    EnableWindow(cancel_button, form_state != STATE_SENDING);
+    SetWindowTextA(next_button, form_state == STATE_SENDING ? "Sender ..." :
+        form_state == STATE_SENT ? "Sendt" :
+        current_page == PAGE_MESSAGE ? "Send indmeldelse" : "N\346ste >");
+    SetWindowTextA(cancel_button, form_state == STATE_SENT ? "Luk" : "Annuller");
+    SetWindowTextA(main_window, form_state == STATE_SENDING ? "hal9k - Indmeldelse (sender)" :
+        form_state == STATE_SENT ? "hal9k - Indmeldelse (sendt)" : "hal9k - Indmeldelse");
     if (status) SetWindowTextA(status_text, status);
 }
 
+static void apply_state(int state, const char *status)
+{
+    HWND focus = GetFocus();
+    form_state = state;
+    if (state != STATE_EDITING && focus &&
+            (focus == main_window || IsChild(main_window, focus)))
+        SetFocus(main_window);
+    sync_controls(status);
+}
+
+static void show_page(int page)
+{
+    int i;
+    current_page = page;
+    ShowWindow(intro_text, page == PAGE_INTRO ? SW_SHOW : SW_HIDE);
+    for (i = 0; i < 8; ++i) {
+        ShowWindow(field_labels[i], page == PAGE_PERSONAL ? SW_SHOW : SW_HIDE);
+        ShowWindow(fields[i], page == PAGE_PERSONAL ? SW_SHOW : SW_HIDE);
+    }
+    ShowWindow(member_label, page == PAGE_MEMBER ? SW_SHOW : SW_HIDE);
+    ShowWindow(member_help, page == PAGE_MEMBER ? SW_SHOW : SW_HIDE);
+    ShowWindow(ordinary_button, page == PAGE_MEMBER ? SW_SHOW : SW_HIDE);
+    ShowWindow(student_button, page == PAGE_MEMBER ? SW_SHOW : SW_HIDE);
+    ShowWindow(message_label, page == PAGE_MESSAGE ? SW_SHOW : SW_HIDE);
+    ShowWindow(message_field, page == PAGE_MESSAGE ? SW_SHOW : SW_HIDE);
+    SetWindowTextA(page_title, page_titles[page - 1]);
+    SetWindowTextA(page_subtitle, page_subtitles[page - 1]);
+    sync_controls(NULL);
+}
+
+static void focus_for_page(void)
+{
+    if (current_page == PAGE_PERSONAL) SetFocus(fields[0]);
+    else if (current_page == PAGE_MEMBER) SetFocus(ordinary_button);
+    else if (current_page == PAGE_MESSAGE) SetFocus(message_field);
+    else SetFocus(next_button);
+}
+
+static void go_next(void)
+{
+    if (form_state != STATE_EDITING) return;
+    if (current_page == PAGE_PERSONAL && !check_form()) return;
+    if (current_page < PAGE_MESSAGE) {
+        show_page(current_page + 1);
+        SetWindowTextA(status_text, "");
+        focus_for_page();
+        return;
+    }
+    /* Last page: validate again in case an earlier page was edited, and stop
+       if validation pulled the wizard back to the personal details. */
+    if (!check_form() || current_page != PAGE_MESSAGE) return;
+    start_send();
+}
+
+static void go_back(void)
+{
+    if (form_state != STATE_EDITING || current_page == PAGE_INTRO) return;
+    show_page(current_page - 1);
+    SetWindowTextA(status_text, "");
+    focus_for_page();
+}
+
+/* Sample data for the --test-data option: valid input that can be submitted
+   unchanged, including Danish characters to exercise the payload encoding. */
 /* Sample data for the --test-data option: valid input that can be submitted
    unchanged, including Danish characters to exercise the payload encoding. */
 static void prefill_test_data(void)
@@ -262,8 +364,10 @@ static void prefill_test_data(void)
     int i;
     for (i = 0; i < 8; ++i) SetWindowTextA(fields[i], values[i]);
     SetWindowTextA(message_field, "Testbesked med \346\370\345 fra kommandolinjen.");
-    apply_state(STATE_EDITING, "Testdata indl\346st. Kontroller og send.");
     SendMessageA(ordinary_button, BM_SETCHECK, BST_CHECKED, 0);
+    show_page(PAGE_PERSONAL);
+    apply_state(STATE_EDITING, "Testdata indl\346st. Kontroller og send.");
+    SetFocus(fields[0]);
 }
 
 /* After a successful send the form is frozen, so the dialog repeats what was
@@ -275,7 +379,7 @@ static void show_sent_dialog(void)
     GetWindowTextA(fields[1], last, sizeof(last));
     GetWindowTextA(fields[2], email, sizeof(email));
     format_time(time_text, sizeof(time_text));
-    lstrcpyA(text, "Indmeldelsen er sendt til Slack kl. ");
+    lstrcpyA(text, "Indmeldelsen er sendt kl. ");
     lstrcatA(text, time_text);
     lstrcatA(text, ".\n\nNavn: ");
     lstrcatA(text, first);
@@ -564,21 +668,21 @@ static int post_to_slack(void)
     }
     if (!HttpSendRequestA(request, "Content-Type: application/json\r\n", -1,
             payload, (DWORD)payload_length)) {
-        set_result_number("Kunne ikke sende til Slack. Fejl ", GetLastError());
+        set_result_number("Kunne ikke sende indmeldelsen. Fejl ", GetLastError());
         goto done;
     }
     if (!HttpQueryInfoA(request, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
             &status, &size, NULL)) {
-        set_result_number("Ukendt svar fra Slack. Fejl ", GetLastError());
+        set_result_number("Ukendt svar fra serveren. Fejl ", GetLastError());
         goto done;
     }
     if (status == 200) {
-        lstrcpyA(result_text, "Indmeldelse sendt til Slack.");
+        lstrcpyA(result_text, "Indmeldelse sendt.");
         ok = 1;
     } else if (status == 0) {
-        lstrcpyA(result_text, "Ukendt svar fra Slack. Intet blev sendt.");
+        lstrcpyA(result_text, "Ukendt svar fra serveren. Intet blev sendt.");
     } else {
-        set_result_number("Slack svarede HTTP ", status);
+        set_result_number("Serveren svarede HTTP ", status);
         read_response_body(request, body, sizeof(body));
         keep_printable(body);
         if (body[0]) {
@@ -636,7 +740,7 @@ static void start_send(void)
         return;
     }
     if (MessageBoxA(main_window,
-            "Oplysningerne sendes til Slack. Forts\346t?",
+            "Oplysningerne sendes til foreningen. Forts\346t?",
             "Send indmeldelse", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
         return;
     if (!build_payload()) {
@@ -644,7 +748,7 @@ static void start_send(void)
         return;
     }
     lstrcpyA(result_text, "Ingen afsendelse gennemf\370rt.");
-    apply_state(STATE_SENDING, "Sender indmeldelse til Slack ...");
+    apply_state(STATE_SENDING, "Sender indmeldelse ...");
     thread = CreateThread(NULL, 0, send_thread, NULL, 0, &thread_id);
     if (!thread) {
         apply_state(STATE_EDITING, "Kunne ikke starte afsendelsen.");
@@ -653,67 +757,125 @@ static void start_send(void)
     CloseHandle(thread);
 }
 
+/* Wizard keys: Enter advances or finishes, Escape cancels. Enter inside the
+   optional message still inserts a newline. */
+static BOOL handle_wizard_keys(HWND window, const MSG *message)
+{
+    if (form_state != STATE_EDITING) return FALSE;
+    if (message->message != WM_KEYDOWN) return FALSE;
+    if (message->hwnd != window && !IsChild(window, message->hwnd)) return FALSE;
+    if (message->wParam == VK_RETURN) {
+        if (GetFocus() == message_field) return FALSE;
+        go_next();
+        return TRUE;
+    }
+    if (message->wParam == VK_ESCAPE) {
+        PostMessageA(window, WM_CLOSE, 0, 0);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
 {
     switch (message) {
     case WM_CREATE: {
-        HWND control;
         char text[64];
         main_window = window;
         font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        add_control(window, "STATIC", "Indmeldelse til hal9k", 0, 0,
-            20, 20, 550, 18, 0, font);
-        add_control(window, "STATIC", "Udfyld dine oplysninger. Felter med * er obligatoriske.", 0, 0,
-            20, 55, 550, 18, 0, font);
+        header_font = CreateFontA(-13, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+            DEFAULT_PITCH | FF_SWISS, "MS Sans Serif");
+        if (!header_font) header_font = font;
 
-        fields[0] = add_field(window, "Fornavn(e) *", 'F', 20, 87, 270, ID_FIRST, 256);
-        fields[1] = add_field(window, "Efternavn(e) *", 'E', 310, 87, 270, ID_LAST, 256);
-        fields[2] = add_field(window, "Email *", 'M', 20, 130, 270, ID_EMAIL, 256);
-        fields[3] = add_field(window, "Vejnavn og nr. *", 'V', 310, 130, 270, ID_STREET, 256);
-        fields[4] = add_field(window, "Postnummer *", 'P', 20, 173, 270, ID_POSTCODE, 4);
-        fields[5] = add_field(window, "By *", 'B', 310, 173, 270, ID_CITY, 256);
-        fields[6] = add_field(window, "F\370dselsdato *  (dd-mm-yyyy)", 'D', 20, 216, 270, ID_BIRTH, 10);
-        fields[7] = add_field(window, "Telefon nr. *", 'T', 310, 216, 270, ID_PHONE, 256);
+        page_title = add_control(window, "STATIC", "", 0, 0, 20, 14, 560, 20, 0, header_font);
+        page_subtitle = add_control(window, "STATIC", "", 0, 0, 20, 38, 560, 32, 0, font);
+        add_control(window, "STATIC", "", SS_ETCHEDHORZ, 0, 7, 74, 591, 2, 0, font);
 
-        add_control(window, "STATIC", "Medlemsskab *", 0, 0, 20, 261, 200, 16, 0, font);
-        label_with_mnemonic("Almindeligt medlem", 'A', text, sizeof(text));
+        intro_text = add_control(window, "STATIC",
+            "Hal9k er Aalborgs hackerspace - et sted for nysgerrige mennesker. Her "
+            "bygger, l\346rer og deler vi viden om teknik, elektronik, mekanik og "
+            "software, og alle er velkomne.\n"
+            "\n"
+            "Byg noget. L\346r noget. G\370r det sammen.\n"
+            "\n"
+            "Vi m\370des hver torsdag fra kl. 19.00 p\345 Sofiendalsvej 80, "
+            "9200 Aalborg SV.\n"
+            "\n"
+            "Denne assistent f\370rer dig gennem fire trin og tager kun et par minutter. "
+            "Brug N\346ste og Tilbage for at skifte trin, og Annuller for at afslutte. "
+            "Programmet kr\346ver ingen installation og kan k\370res direkte fra cd'en.\n"
+            "\n"
+            "N\345r du har bekr\346ftet p\345 den sidste side, sendes dine oplysninger "
+            "til foreningen. L\346s overlevelsesguiden, inden du kigger forbi f\370rste "
+            "gang.",
+            0, 0, 20, 92, 560, 240, 0, font);
+
+        fields[0] = add_field(window, "Fornavn(e) *", 'F', 20, 92, 270, ID_FIRST, 256, &field_labels[0]);
+        fields[1] = add_field(window, "Efternavn(e) *", 'E', 310, 92, 270, ID_LAST, 256, &field_labels[1]);
+        fields[2] = add_field(window, "Email *", 'M', 20, 135, 270, ID_EMAIL, 256, &field_labels[2]);
+        fields[3] = add_field(window, "Vejnavn og nr. *", 'V', 310, 135, 270, ID_STREET, 256, &field_labels[3]);
+        fields[4] = add_field(window, "Postnummer *", 'P', 20, 178, 270, ID_POSTCODE, 4, &field_labels[4]);
+        fields[5] = add_field(window, "By *", 'B', 310, 178, 270, ID_CITY, 256, &field_labels[5]);
+        fields[6] = add_field(window, "F\370dselsdato *  (dd-mm-yyyy)", 'D', 20, 221, 270, ID_BIRTH, 10, &field_labels[6]);
+        fields[7] = add_field(window, "Telefon nr. *", 'T', 310, 221, 270, ID_PHONE, 256, &field_labels[7]);
+
+        member_label = add_control(window, "STATIC", "Medlemsskab *", 0, 0, 20, 92, 200, 16, 0, font);
+        label_with_mnemonic("Almindeligt medlem - 150 kr. pr. md.", 'A', text, sizeof(text));
         ordinary_button = add_control(window, "BUTTON", text,
-            WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON, 0, 20, 279, 200, 22, ID_ORDINARY, font);
+            WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON, 0, 20, 114, 560, 22, ID_ORDINARY, font);
         SendMessageA(ordinary_button, BM_SETCHECK, BST_CHECKED, 0);
         add_mnemonic('A', ordinary_button, TRUE);
-        label_with_mnemonic("Studiemedlem", 'S', text, sizeof(text));
+        label_with_mnemonic("Studiemedlem - 75 kr. pr. md.", 'S', text, sizeof(text));
         student_button = add_control(window, "BUTTON", text,
-            WS_TABSTOP | BS_AUTORADIOBUTTON, 0, 230, 279, 160, 22, ID_STUDENT, font);
+            WS_TABSTOP | BS_AUTORADIOBUTTON, 0, 20, 140, 560, 22, ID_STUDENT, font);
         add_mnemonic('S', student_button, TRUE);
+        member_help = add_control(window, "STATIC",
+            "Kontingentet opkr\346ves hver m\345ned. Er du medlem af PROSA, "
+            "f\345r du halv pris.\n"
+            "\n"
+            "Medlemsskabet giver adgang til lokalerne hele d\370gnet. Adgangskortet "
+            "til d\370ren f\345r du efter introperioden, n\345r du har v\346ret med "
+            "til et par klubaftener om torsdagen - se overlevelsesguiden.\n"
+            "\n"
+            "Du kan g\345 tilbage og \346ndre valget, indtil indmeldelsen er sendt.",
+            0, 0, 20, 174, 560, 100, 0, font);
+
         label_with_mnemonic("Evt. besked / valgfrit", 'K', text, sizeof(text));
-        add_control(window, "STATIC", text, 0, 0, 20, 305, 300, 16, 0, font);
-        control = add_control(window, "EDIT", "", WS_TABSTOP | WS_GROUP | WS_VSCROLL |
+        message_label = add_control(window, "STATIC", text, 0, 0, 20, 92, 300, 16, 0, font);
+        message_field = add_control(window, "EDIT", "", WS_TABSTOP | WS_GROUP | WS_VSCROLL |
             ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN, WS_EX_CLIENTEDGE,
-            20, 322, 560, 50, ID_MESSAGE, font);
-        SendMessageA(control, EM_SETLIMITTEXT, 1000, 0);
-        add_mnemonic('K', control, FALSE);
-        message_field = control;
-        check_button = add_control(window, "BUTTON", "Kontroller felter",
-            WS_TABSTOP | BS_PUSHBUTTON, 0, 20, 376, 140, 27, ID_CHECK, font);
-        send_button = add_control(window, "BUTTON", "Send indmeldelse",
-            WS_TABSTOP | BS_PUSHBUTTON, 0, 170, 376, 140, 27, ID_SEND, font);
-        add_control(window, "STATIC", "Data sendes kun efter bekr\346ftelse.", 0, 0,
-            325, 382, 260, 18, 0, font);
-        status_text = add_control(window, "STATIC", "", 0, 0, 20, 406, 560, 34, 0, font);
+            20, 110, 560, 120, ID_MESSAGE, font);
+        SendMessageA(message_field, EM_SETLIMITTEXT, 1000, 0);
+        add_mnemonic('K', message_field, FALSE);
+
+        status_text = add_control(window, "STATIC", "", 0, 0, 20, 348, 560, 30, 0, font);
+        add_control(window, "STATIC", "", SS_ETCHEDHORZ, 0, 7, 384, 591, 2, 0, font);
+        back_button = add_control(window, "BUTTON", "< Tilbage",
+            WS_TABSTOP | BS_PUSHBUTTON, 0, 270, 392, 100, 27, ID_BACK, font);
+        next_button = add_control(window, "BUTTON", "N\346ste >",
+            WS_TABSTOP | BS_PUSHBUTTON, 0, 380, 392, 125, 27, ID_NEXT, font);
+        cancel_button = add_control(window, "BUTTON", "Annuller",
+            WS_TABSTOP | BS_PUSHBUTTON, 0, 515, 392, 75, 27, ID_CANCEL, font);
+
+        show_page(PAGE_INTRO);
         apply_state(STATE_EDITING, "Ingen oplysninger sendes uden bekr\346ftelse.");
         if (has_test_data_option()) prefill_test_data();
-        SetFocus(fields[0]);
+        SetFocus(next_button);
         return 0;
     }
     case WM_COMMAND:
         if (HIWORD(wparam) != BN_CLICKED) break;
-        if (form_state != STATE_EDITING) break;
-        if (LOWORD(wparam) == ID_CHECK) {
-            check_form();
+        if (LOWORD(wparam) == ID_NEXT) {
+            go_next();
             return 0;
         }
-        if (LOWORD(wparam) == ID_SEND) {
-            if (check_form()) start_send();
+        if (LOWORD(wparam) == ID_BACK) {
+            go_back();
+            return 0;
+        }
+        if (LOWORD(wparam) == ID_CANCEL) {
+            PostMessageA(window, WM_CLOSE, 0, 0);
             return 0;
         }
         break;
@@ -721,7 +883,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
         if (wparam) {
             char time_text[8], line[96];
             format_time(time_text, sizeof(time_text));
-            lstrcpyA(line, "Indmeldelse sendt til Slack kl. ");
+            lstrcpyA(line, "Indmeldelse sendt kl. ");
             lstrcatA(line, time_text);
             lstrcatA(line, ". Luk vinduet.");
             apply_state(STATE_SENT, line);
@@ -764,6 +926,7 @@ void WINAPI WinMainCRTStartup(void)
     ShowWindow(window, SW_SHOWDEFAULT);
     UpdateWindow(window);
     while ((result = GetMessageA(&message, NULL, 0, 0)) > 0) {
+        if (handle_wizard_keys(window, &message)) continue;
         if (handle_mnemonic(window, &message)) continue;
         if (!IsDialogMessageA(window, &message)) {
             TranslateMessage(&message);

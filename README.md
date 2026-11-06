@@ -1,15 +1,21 @@
 # hal9k indmeldelse
 
-A classic Windows-style 32-bit Win32 form inspired by the Danish hal9k
-physics signup page. It includes the name, email, address, birth date,
-telephone, membership and optional message fields, with basic required-field
-and format checks.
+A classic Windows-style 32-bit Win32 signup wizard for Hal9k, the hackerspace
+in Aalborg (`Sofiendalsvej 80, 9200 Aalborg SV`, open Thursdays from 19.00),
+inspired by the club's signup page at `signup.hal9k.dk`. It collects name,
+email, address, birth date, telephone, membership and an optional message,
+with basic required-field and format checks.
+
+The wizard text follows the club's published details: the welcome page
+describes the hackerspace, the Thursday opening and points to the survival
+guide, and the membership page lists the monthly fee (150 kr., 75 kr. for
+students), the PROSA discount and the access card that is issued after the
+intro period.
 
 The details can be posted to a Slack incoming webhook, but only when a
 webhook is configured *and* the send is confirmed in the prompt. Without a
 configuration file the form stays offline and nothing is transmitted. Signups
-are not stored locally, and the website's physics challenge is not
-implemented; email and date validation are basic format checks, not
+are not stored locally; email and date validation are basic format checks, not
 verification of real addresses or dates.
 
 ## Keyboard shortcuts
@@ -34,7 +40,8 @@ reached with `Alt`+that letter.
 Mnemonics use the first free letter of each label, so "Email" and
 "Fødselsdato" are reached by a letter inside the word where the initial
 letter is already taken. Membership keys select the radio button, as in a
-classic dialog. `Tab` and `Shift+Tab` still move between fields.
+classic dialog. Each mnemonic applies to the wizard page that holds the field.
+`Tab` and `Shift+Tab` still move between the fields of the current page.
 
 ## Posting to Slack
 
@@ -51,13 +58,32 @@ url=https://hooks.slack.com/services/T000/B000/XXXX
 holding it can post to that channel. Do not commit it or paste it into a
 screenshot.
 
-**Send indmeldelse** validates the form, asks for confirmation, and then posts
-the fields as a Slack message. The request runs on a worker thread, so a slow
+The last page's **Send indmeldelse** button validates the whole form, asks
+for confirmation, and then posts the fields as a Slack message. The request runs on a worker thread, so a slow
 connection does not freeze the window. The status line reports the outcome:
-`Indmeldelse sendt til Slack.`, `Slack svarede HTTP <code>`, or a WinINet
-error code such as `Kunne ikke sende til Slack. Fejl 12175`. When Slack
-rejects the message its reply is shown too, for example
-`Slack svarede HTTP 400: invalid_payload`.
+`Indmeldelse sendt.`, `Serveren svarede HTTP <code>`, or a WinINet error code
+such as `Kunne ikke sende indmeldelsen. Fejl 12175`. When the endpoint rejects
+the message its reply is shown too, for example
+`Serveren svarede HTTP 400: invalid_payload`.
+
+### Wizard pages
+
+The window is a classic four-page wizard, each page with a bold header and a
+short description:
+
+1. **Velkommen til hal9k** — what the signup is and that nothing is sent before
+   the confirmation on the last page.
+2. **Personlige oplysninger** — name, email, address, postcode, city, birth
+   date and phone. Leaving this page validates the fields and puts the cursor
+   on the first one that needs attention.
+3. **Medlemskab** — ordinary or student membership.
+4. **Valgfri besked** — the optional message, and the finish button.
+
+**Næste >** and **< Tilbage** move between pages; on the last page **Næste >**
+becomes **Send indmeldelse**. `Enter` advances (except inside the message box,
+where it inserts a newline), while `Escape` and **Annuller** close the window.
+Pages can be revisited until the signup is actually sent, and Tab skips the
+hidden pages. Mnemonics still work, but only for fields on the visible page.
 
 ### Form state
 
@@ -68,8 +94,9 @@ The window has three states, which control what can be edited:
   options and both buttons are disabled, the send button reads `Sender ...`,
   and the title bar reads `hal9k - Indmeldelse (sender)`.
 - **Sent** — reached only on success. The form stays disabled on purpose:
-  there is nothing left to resend, and the button reads `Sendt til Slack`
-  while the title bar reads `(sendt)`. Close the window when done.
+  there is nothing left to resend, the finish button reads `Sendt`, the
+  navigation buttons are disabled, `Annuller` becomes `Luk`, and the title bar
+  reads `(sendt)`. Close the window when done.
 
 A failed attempt returns the form to **editing** with the values intact, so
 the same details can be sent again after fixing the configuration or the
@@ -104,9 +131,10 @@ hal9k.exe --test-data
 
 `--test-data` (also `-test-data` or `/test-data`) fills every field with sample
 data that passes validation, including Danish characters, a message and a
-membership choice, so the send path can be exercised without typing. Nothing is
-sent automatically: the usual confirmation still applies, and the status line
-notes that test data was loaded.
+membership choice, so the send path can be exercised without typing. The wizard
+opens on the personal details page with that data filled in. Nothing is sent
+automatically: the usual confirmation still applies, and the status line notes
+that test data was loaded.
 
 ### Windows 98 and TLS
 

@@ -9,6 +9,30 @@ This is an **offline demo**: it does not transmit or save data, create a
 membership, or implement the website's physics challenge. Email and date
 validation are basic format checks, not verification of real addresses or dates.
 
+## Keyboard shortcuts
+
+Every field has a classic mnemonic: the underlined letter in each label is
+reached with `Alt`+that letter.
+
+| Shortcut | Field |
+| -------- | ----- |
+| `Alt+F` | Fornavn(e) |
+| `Alt+E` | Efternavn(e) |
+| `Alt+M` | Email |
+| `Alt+V` | Vejnavn og nr. |
+| `Alt+P` | Postnummer |
+| `Alt+B` | By |
+| `Alt+D` | Fødselsdato |
+| `Alt+T` | Telefon nr. |
+| `Alt+A` | Almindeligt medlem |
+| `Alt+S` | Studiemedlem |
+| `Alt+K` | Evt. besked |
+
+Mnemonics use the first free letter of each label, so "Email" and
+"Fødselsdato" are reached by a letter inside the word where the initial
+letter is already taken. Membership keys select the radio button, as in a
+classic dialog. `Tab` and `Shift+Tab` still move between fields.
+
 ## Build
 
 Install the MinGW-w64 cross-compiler, then run:

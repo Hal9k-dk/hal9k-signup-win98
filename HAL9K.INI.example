@@ -1,0 +1,9 @@
+; Copy this file to HAL9K.INI next to HAL9K.EXE and replace the URL with your
+; own Slack incoming webhook. HAL9K.INI is git-ignored: the webhook URL is a
+; secret, so keep it out of the repository and out of screenshots.
+;
+; Nothing is sent unless this file exists, the URL is filled in, and the
+; signup is confirmed in the confirmation prompt.
+
+[slack]
+url=https://hooks.slack.com/services/REPLACE/ME/WITH_YOUR_WEBHOOK

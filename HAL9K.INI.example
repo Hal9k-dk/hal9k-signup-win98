@@ -1,9 +1,16 @@
-; Copy this file to HAL9K.INI next to HAL9K.EXE and replace the URL with your
-; own Slack incoming webhook. HAL9K.INI is git-ignored: the webhook URL is a
-; secret, so keep it out of the repository and out of screenshots.
+; Copy this file to HAL9K.INI next to HAL9K.EXE and fill in where signups
+; should go. HAL9K.INI is git-ignored: a webhook URL is a credential, so keep
+; it out of the repository and out of screenshots.
 ;
-; Nothing is sent unless this file exists, the URL is filled in, and the
+; Nothing is sent unless this file exists, an address is filled in, and the
 ; signup is confirmed in the confirmation prompt.
 
-[slack]
-url=https://hooks.slack.com/services/REPLACE/ME/WITH_YOUR_WEBHOOK
+; The signup service deployed from drillpress is preferred. It checks the
+; fields, delivers the signup to hal9k and answers with a receipt.
+[signup]
+url=https://signup.hal9k.dk/api/signup
+
+; A Slack incoming webhook can be used instead, for example when no signup
+; service is reachable. The [signup] section wins when both are filled in.
+;[slack]
+;url=https://hooks.slack.com/services/REPLACE/ME/WITH_YOUR_WEBHOOK

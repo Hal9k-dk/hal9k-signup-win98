@@ -12,11 +12,14 @@ guide, and the membership page lists the monthly fee (150 kr., 75 kr. for
 students), the PROSA discount and the access card that is issued after the
 intro period.
 
-The details can be posted to a Slack incoming webhook, but only when a
-webhook is configured *and* the send is confirmed in the prompt. Without a
+The details can be posted to the signup service at `signup.hal9k.dk` — the
+`POST /api/signup` endpoint deployed from the drillpress repository — or, when
+no service is configured, directly to a Slack incoming webhook. Either way the
+send needs a configured address *and* confirmation in the prompt. Without a
 configuration file the form stays offline and nothing is transmitted. Signups
-are not stored locally; email and date validation are basic format checks, not
-verification of real addresses or dates.
+are not stored locally; the form's email and date checks are basic format
+checks, and the signup service re-checks every field, including that the birth
+date is a real, non-future date.
 
 ## Keyboard shortcuts
 
@@ -43,28 +46,51 @@ letter is already taken. Membership keys select the radio button, as in a
 classic dialog. Each mnemonic applies to the wizard page that holds the field.
 `Tab` and `Shift+Tab` still move between the fields of the current page.
 
-## Posting to Slack
+## Posting a signup
 
 Copy `HAL9K.INI.example` to `HAL9K.INI` next to `HAL9K.EXE` (the same folder
-as the executable, also when running it from a CD) and fill in the webhook
-URL:
+as the executable, also when running it from a CD) and fill in where the
+signup should go. The signup service is the normal choice:
+
+```ini
+[signup]
+url=https://signup.hal9k.dk/api/signup
+```
+
+That is the service deployed from the drillpress repository. It accepts one
+JSON object, checks every field again and forwards the signup to hal9k. The
+wizard sends the documented v1 contract — `firstName`, `lastName`, `email`,
+`street`, `postalCode`, `city`, `birthDate`, `phone`, `membership` (`ordinary`
+or `student`) and the optional `message` — with the values as typed, so the
+service receives the text itself rather than Slack markup.
+
+Alternatively the fields can be posted straight to a Slack incoming webhook:
 
 ```ini
 [slack]
 url=https://hooks.slack.com/services/T000/B000/XXXX
 ```
 
-`HAL9K.INI` is git-ignored because the webhook URL is a credential: anyone
-holding it can post to that channel. Do not commit it or paste it into a
-screenshot.
+When both sections are filled in, `[signup]` wins. A webhook URL is a
+credential: anyone holding it can post to that channel. `HAL9K.INI` is
+git-ignored, so do not commit it or paste it into a screenshot.
 
-The last page's **Send indmeldelse** button validates the whole form, asks
-for confirmation, and then posts the fields as a Slack message. The request runs on a worker thread, so a slow
-connection does not freeze the window. The status line reports the outcome:
-`Indmeldelse sendt.`, `Serveren svarede HTTP <code>`, or a WinINet error code
-such as `Kunne ikke sende indmeldelsen. Fejl 12175`. When the endpoint rejects
-the message its reply is shown too, for example
-`Serveren svarede HTTP 400: invalid_payload`.
+The last page's **Send indmeldelse** button validates the whole form, asks for
+confirmation, and then posts it. The request runs on a worker thread, so a
+slow connection does not freeze the window. The status line reports the
+outcome: `Indmeldelse sendt.` or a WinINet error code such as
+`Kunne ikke sende indmeldelsen. Fejl 12175`. A rejected signup is reported with
+the service's own explanation and the fields it objected to, for example:
+
+```
+Serveren svarede HTTP 422: Kontrollér felterne.
+Fødselsdato: Brug en gyldig fødselsdato i formatet dd-mm-yyyy.
+```
+
+Other responses (`HTTP 400`, `HTTP 415`, `HTTP 502`) show the service's
+message, while a Slack webhook error shows its short reply such as
+`Serveren svarede HTTP 400: invalid_payload`. On a successful send the result
+dialog also repeats the receipt returned by the signup service.
 
 ### Wizard pages
 
@@ -105,9 +131,24 @@ the failure reason.
 
 ### Testing locally
 
-`tools/fake-slack-webhook.py` is a dependency-free stand-in for a webhook: it
-accepts the POST, prints the signup in the terminal, and lists received
-signups at the same address in a browser.
+`tools/fake-signup-api.py` is a dependency-free stand-in for the signup
+service: it validates the same contract, prints each signup in the terminal,
+lists received signups at the same address in a browser, and can simulate a
+Slack delivery failure.
+
+```sh
+python3 tools/fake-signup-api.py --port 8766
+```
+
+```ini
+[signup]
+url=http://127.0.0.1:8766/api/signup
+```
+
+Open `http://127.0.0.1:8766/` to see the submissions. Add `--slack-fail` to
+answer every valid signup with the service's `HTTP 502`, which exercises the
+failure path without touching the network. `tools/fake-slack-webhook.py` does
+the same for the direct webhook path:
 
 ```sh
 python3 tools/fake-slack-webhook.py --port 8765
@@ -118,8 +159,8 @@ python3 tools/fake-slack-webhook.py --port 8765
 url=http://127.0.0.1:8765/hook
 ```
 
-Then open `http://127.0.0.1:8765/` to see the submissions. Nothing leaves the
-machine, so this is the safe way to try the send path and the form states.
+Nothing leaves the machine either way, so this is the safe way to try the
+send path, the error display and the form states.
 
 ### Prefilled test data
 
@@ -138,11 +179,21 @@ that test data was loaded.
 
 ### Windows 98 and TLS
 
-Slack requires TLS 1.2 or newer for webhooks. Windows 98's WinINet/schannel
-stops at TLS 1.0, so posting straight to `hooks.slack.com` fails there with a
-connection or certificate error. On Windows 95/98/Me, point `url` at an
-internal plain-HTTP relay that forwards to Slack over TLS instead, for
-example an nginx location:
+`signup.hal9k.dk` and Slack both require TLS 1.2 or newer. Windows 98's
+WinINet/schannel stops at TLS 1.0, so posting straight to either fails there
+with a connection or certificate error. On Windows 95/98/Me, point the URL at
+an internal plain-HTTP relay that forwards over TLS instead, for example an
+nginx location:
+
+```nginx
+location /signup/api/ {
+    proxy_pass https://signup.hal9k.dk/api/;
+    proxy_set_header Content-Type application/json;
+}
+```
+
+and use `url=http://relay.example.internal/signup/api/signup`. The webhook path
+has the same shape:
 
 ```nginx
 location /hal9k {
@@ -151,13 +202,14 @@ location /hal9k {
 }
 ```
 
-and use `url=http://relay.example.internal/hal9k`. Keep the real webhook URL
-in the relay's configuration, not in the form. On Windows 2000 and later the
-webhook URL can be used directly.
+with `[slack] url=http://relay.example.internal/hal9k`. Keep the real webhook
+URL in the relay's configuration, not in the form. On Windows 2000 and later
+the addresses can be used directly.
 
-The message contains personal data (name, address, email, phone, birth date).
-Everyone who can read the target channel can see it, so choose the channel
-and the retention policy accordingly.
+The signup contains personal data (name, address, email, phone, birth date).
+The signup service logs it and sends it to Slack, so restrict access to the
+service logs and to the target channel, and choose the retention policy
+accordingly.
 
 ## Build
 
@@ -174,7 +226,7 @@ make hal9k.iso
 ```
 
 The ISO contains `HAL9K.EXE` and `AUTORUN.INF`; `HAL9K.INI` is not included,
-so add it yourself if the CD should post to Slack. Mount it as a CD in a
+so add it yourself if the CD should send signups. Mount it as a CD in a
 Windows 98 virtual machine or burn it to a CD. AutoRun depends on Windows
 and drive settings; if it does not start, open `HAL9K.EXE` manually. The ISO
 is not bootable. `make clean` removes the generated executable, resource

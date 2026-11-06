@@ -32,6 +32,9 @@ static HWND member_label, member_help, message_label;
 static HWND back_button, next_button, cancel_button;
 static HFONT header_font;
 
+/* Receipt text returned by the signup service, shown with the send result. */
+static char server_message[256];
+
 static void show_page(int page);
 static void sync_controls(const char *status);
 static int check_form(void);
@@ -387,25 +390,41 @@ static void show_sent_dialog(void)
     lstrcatA(text, last);
     lstrcatA(text, "\nEmail: ");
     lstrcatA(text, email);
+    /* The signup service answers with a receipt; the Slack webhook does not. */
+    if (server_message[0]) {
+        lstrcatA(text, "\n\n");
+        lstrcatA(text, server_message);
+    }
     lstrcatA(text, "\n\nOplysningerne kan ikke sendes igen. Luk vinduet.");
     MessageBoxA(main_window, text, "Indmeldelse sendt", MB_OK | MB_ICONINFORMATION);
 }
 
-/* --- Slack webhook -------------------------------------------------------
-   The webhook URL is a secret, so it is never compiled in: it is read from
-   HAL9K.INI next to the executable. The request runs on a worker thread so
-   a slow dial-up link cannot freeze the form. */
+/* --- Sending -------------------------------------------------------------
+   Signups go to the signup service (POST /api/signup, the endpoint deployed
+   from drillpress) when HAL9K.INI has a [signup] url. Without it the older
+   direct Slack webhook is used, so an existing configuration keeps working.
+   Neither URL is compiled in: it is read from HAL9K.INI next to the
+   executable, and without that file nothing is transmitted. The request runs
+   on a worker thread so a slow dial-up link cannot freeze the form. */
 
 #define CONFIG_FILE "HAL9K.INI"
 #define URL_MAX 512
 #define PAYLOAD_MAX 16384
+#define BODY_MAX 1024
 #define HOST_MAX 128
 #define URL_PATH_MAX 512
 
+/* The signup service speaks the documented JSON contract; a Slack incoming
+   webhook takes one mrkdwn message instead. */
+#define SEND_SIGNUP_API 1
+#define SEND_SLACK 2
+
+static char endpoint_url[URL_MAX];
 static char webhook_url[URL_MAX];
+static int send_mode = SEND_SIGNUP_API;
 static char payload[PAYLOAD_MAX];
 static int payload_length;
-static char result_text[160];
+static char result_text[640];
 
 /* Windows-1252 bytes 0x80-0x9F are not Latin-1, so they need a table to
    become the right Unicode code points in the JSON payload. */
@@ -448,20 +467,21 @@ static int append_unicode_escape(unsigned int codepoint)
     return append_bytes(out, 6);
 }
 
-/* Escape for both JSON and Slack's mrkdwn, since &, < and > would otherwise
-   be read as markup. */
-static int append_json(const char *text)
+/* Escape as JSON. Slack's mrkdwn additionally reads &, < and > as markup, so
+   only the Slack payload escapes those; the signup API must receive the text
+   the user typed and would otherwise store the entities literally. */
+static int append_json(const char *text, int slack_markup)
 {
     unsigned char byte;
     char one[1];
     int i;
     for (i = 0; text[i]; ++i) {
         byte = (unsigned char)text[i];
-        if (byte == '&') {
+        if (slack_markup && byte == '&') {
             if (!append_text("&amp;")) return 0;
-        } else if (byte == '<') {
+        } else if (slack_markup && byte == '<') {
             if (!append_text("&lt;")) return 0;
-        } else if (byte == '>') {
+        } else if (slack_markup && byte == '>') {
             if (!append_text("&gt;")) return 0;
         } else if (byte == '"') {
             if (!append_text("\\\"")) return 0;
@@ -487,7 +507,40 @@ static int append_json(const char *text)
     return 1;
 }
 
-static int build_payload(void)
+/* The v1 contract: one JSON object of strings, every property except message
+   required, unknown properties rejected. Keys are part of that contract, not
+   free-form labels, so they stay camelCase even though the form is Danish. */
+static int build_api_payload(void)
+{
+    static const char *keys[8] = {
+        "firstName", "lastName", "email", "street",
+        "postalCode", "city", "birthDate", "phone"
+    };
+    char value[1025];
+    int i;
+    payload_length = 0;
+    if (!append_text("{")) return 0;
+    for (i = 0; i < 8; ++i) {
+        GetWindowTextA(fields[i], value, sizeof(value));
+        if (i && !append_text(",")) return 0;
+        if (!append_text("\"")) return 0;
+        if (!append_text(keys[i])) return 0;
+        if (!append_text("\":\"")) return 0;
+        if (!append_json(value, 0)) return 0;
+        if (!append_text("\"")) return 0;
+    }
+    GetWindowTextA(message_field, value, sizeof(value));
+    if (!append_text(",\"membership\":\"")) return 0;
+    if (!append_text(SendMessageA(GetDlgItem(main_window, ID_STUDENT),
+            BM_GETCHECK, 0, 0) == BST_CHECKED ? "student" : "ordinary")) return 0;
+    if (!append_text("\",\"message\":\"")) return 0;
+    if (!append_json(value, 0)) return 0;
+    if (!append_text("\"}")) return 0;
+    payload[payload_length] = '\0';
+    return 1;
+}
+
+static int build_slack_payload(void)
 {
     static const char *labels[8] = {
         "Fornavn(e)", "Efternavn(e)", "Email", "Vejnavn og nr.",
@@ -501,17 +554,17 @@ static int build_payload(void)
     for (i = 0; i < 8; ++i) {
         GetWindowTextA(fields[i], value, sizeof(value));
         if (!append_text("*")) return 0;
-        if (!append_json(labels[i])) return 0;
+        if (!append_json(labels[i], 1)) return 0;
         if (!append_text(":* ")) return 0;
-        if (!append_json(value)) return 0;
+        if (!append_json(value, 1)) return 0;
         if (!append_text("\\n")) return 0;
     }
     GetWindowTextA(message_field, value, sizeof(value));
     if (!append_text("*Besked:* ")) return 0;
-    if (!append_json(value)) return 0;
+    if (!append_json(value, 1)) return 0;
     if (!append_text("\\n*Medlemsskab:* ")) return 0;
     if (!append_json(SendMessageA(GetDlgItem(main_window, ID_STUDENT),
-            BM_GETCHECK, 0, 0) == BST_CHECKED ? "Studiemedlem" : "Almindeligt medlem"))
+            BM_GETCHECK, 0, 0) == BST_CHECKED ? "Studiemedlem" : "Almindeligt medlem", 1))
         return 0;
     if (!append_text("\"}")) return 0;
     payload[payload_length] = '\0';
@@ -545,7 +598,7 @@ static int starts_with_ci(const char *text, const char *prefix)
     return 1;
 }
 
-/* Split the webhook URL by hand: InternetCrackUrlA is documented for
+/* Split the configured address by hand: InternetCrackUrlA is documented for
    Windows 2000 and later, and this target is Windows 98. */
 static int split_url(const char *url, char *host, int host_size,
                      unsigned short *port, int *secure,
@@ -633,17 +686,161 @@ static void keep_printable(char *text)
     text[output] = '\0';
 }
 
-static int post_to_slack(void)
+/* The signup API answers UTF-8 JSON, but the ANSI controls display
+   Windows-1252, so replies are decoded into that code page for display. */
+static const char *find_substring(const char *text, const char *pattern)
 {
-    char host[HOST_MAX], path[URL_PATH_MAX], body[81];
+    const char *p;
+    int i;
+    for (p = text; *p; ++p) {
+        for (i = 0; pattern[i] && p[i] == pattern[i]; ++i)
+            ;
+        if (!pattern[i]) return p;
+    }
+    return NULL;
+}
+
+static int read_hex4(const char *text, unsigned int *value)
+{
+    unsigned int result = 0;
+    int i;
+    for (i = 0; i < 4; ++i) {
+        char c = text[i];
+        result <<= 4;
+        if (c >= '0' && c <= '9') result |= (unsigned int)(c - '0');
+        else if (c >= 'a' && c <= 'f') result |= (unsigned int)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') result |= (unsigned int)(c - 'A' + 10);
+        else return 0;
+    }
+    *value = result;
+    return 1;
+}
+
+static char cp1252_from_unicode(unsigned int codepoint)
+{
+    int i;
+    if (codepoint < 0x80) return (char)codepoint;
+    if (codepoint >= 0xA0 && codepoint <= 0xFF) return (char)codepoint;
+    for (i = 0; i < 32; ++i)
+        if (cp1252_high[i] == codepoint) return (char)(0x80 + i);
+    return '?';
+}
+
+/* Copy the body of a JSON string (the bytes after the opening quote) up to
+   the closing quote, decoding \u escapes and UTF-8 along the way. */
+static void decode_json_text(const char *text, char *out, int size)
+{
+    const char *p = text;
+    unsigned int codepoint;
+    int length = 0;
+    while (*p && *p != '"') {
+        unsigned char byte = (unsigned char)*p;
+        if (byte == '\\' && p[1]) {
+            ++p;
+            switch (*p) {
+            case 'n': codepoint = '\n'; ++p; break;
+            case 't': codepoint = '\t'; ++p; break;
+            case 'r': codepoint = '\r'; ++p; break;
+            case 'b': codepoint = '\b'; ++p; break;
+            case 'f': codepoint = '\f'; ++p; break;
+            case 'u':
+                ++p;
+                if (read_hex4(p, &codepoint)) p += 4;
+                else codepoint = '?';
+                break;
+            default: codepoint = (unsigned char)*p; ++p; break;
+            }
+        } else if (byte < 0x80) {
+            codepoint = byte;
+            ++p;
+        } else if ((byte & 0xE0) == 0xC0 && p[1] &&
+                ((unsigned char)p[1] & 0xC0) == 0x80) {
+            codepoint = ((unsigned int)(byte & 0x1F) << 6) |
+                ((unsigned char)p[1] & 0x3F);
+            p += 2;
+        } else if ((byte & 0xF0) == 0xE0 && p[1] && p[2] &&
+                ((unsigned char)p[1] & 0xC0) == 0x80 &&
+                ((unsigned char)p[2] & 0xC0) == 0x80) {
+            codepoint = ((unsigned int)(byte & 0x0F) << 12) |
+                ((unsigned int)((unsigned char)p[1] & 0x3F) << 6) |
+                ((unsigned char)p[2] & 0x3F);
+            p += 3;
+        } else {
+            codepoint = '?';
+            ++p;
+        }
+        if (length < size - 1) out[length++] = cp1252_from_unicode(codepoint);
+    }
+    out[length] = '\0';
+}
+
+/* Find "key":"value" and return the decoded value. The bodies involved are
+   small and the keys are unique, so a scan is enough; no JSON parser is
+   linked in this CRT-free build. */
+static int find_json_text(const char *json, const char *key, char *out, int size)
+{
+    char pattern[64];
+    const char *hit;
+    out[0] = '\0';
+    if (lstrlenA(key) + 3 > (int)sizeof(pattern)) return 0;
+    pattern[0] = '"';
+    lstrcpyA(pattern + 1, key);
+    lstrcatA(pattern, "\"");
+    hit = find_substring(json, pattern);
+    if (!hit) return 0;
+    hit += lstrlenA(pattern);
+    while (*hit == ' ' || *hit == '\t' || *hit == '\r' || *hit == '\n') ++hit;
+    if (*hit != ':') return 0;
+    ++hit;
+    while (*hit == ' ' || *hit == '\t' || *hit == '\r' || *hit == '\n') ++hit;
+    if (*hit != '"') return 0;
+    decode_json_text(hit + 1, out, size);
+    return 1;
+}
+
+/* A 422 names the rejected fields; show them with the Danish labels the form
+   uses, one per line, so the user knows what to correct. */
+static void collect_field_errors(const char *body, char *out, int size)
+{
+    static const char *keys[10] = {
+        "firstName", "lastName", "email", "street", "postalCode",
+        "city", "birthDate", "phone", "membership", "message"
+    };
+    static const char *labels[10] = {
+        "Fornavn", "Efternavn", "Email", "Vejnavn og nr.", "Postnummer",
+        "By", "F\370" "dselsdato", "Telefon nr.", "Medlemsskab", "Besked"
+    };
+    char value[256], line[320];
+    int i, length = 0;
+    out[0] = '\0';
+    for (i = 0; i < 10; ++i) {
+        if (!find_json_text(body, keys[i], value, sizeof(value)) || !value[0])
+            continue;
+        lstrcpynA(line, labels[i], sizeof(line));
+        lstrcatA(line, ": ");
+        lstrcatA(line, value);
+        if (length > 0) {
+            if (length >= size - 1) break;
+            out[length++] = '\n';
+        }
+        lstrcpynA(out + length, line, size - length);
+        length += lstrlenA(out + length);
+    }
+    out[length < size ? length : size - 1] = '\0';
+}
+
+static int post_signup(void)
+{
+    char host[HOST_MAX], path[URL_PATH_MAX], body[BODY_MAX];
+    const char *url = send_mode == SEND_SLACK ? webhook_url : endpoint_url;
     unsigned short port = 0;
     int secure = 0, ok = 0;
     DWORD flags, status = 0, size = sizeof(status);
     HINTERNET session = NULL, connection = NULL, request = NULL;
 
-    if (!split_url(webhook_url, host, sizeof(host), &port, &secure,
+    if (!split_url(url, host, sizeof(host), &port, &secure,
             path, sizeof(path))) {
-        lstrcpyA(result_text, "Webhook-adressen i HAL9K.INI er ugyldig.");
+        lstrcpyA(result_text, "Adressen i HAL9K.INI er ugyldig.");
         return 0;
     }
     session = InternetOpenA("hal9k-signup/1.0", INTERNET_OPEN_TYPE_PRECONFIG,
@@ -678,16 +875,40 @@ static int post_to_slack(void)
     }
     if (status == 200) {
         lstrcpyA(result_text, "Indmeldelse sendt.");
+        server_message[0] = '\0';
+        if (send_mode == SEND_SIGNUP_API) {
+            read_response_body(request, body, sizeof(body));
+            find_json_text(body, "message", server_message,
+                sizeof(server_message));
+        }
         ok = 1;
     } else if (status == 0) {
         lstrcpyA(result_text, "Ukendt svar fra serveren. Intet blev sendt.");
     } else {
+        char error[192], details[384];
         set_result_number("Serveren svarede HTTP ", status);
         read_response_body(request, body, sizeof(body));
-        keep_printable(body);
-        if (body[0]) {
+        error[0] = '\0';
+        details[0] = '\0';
+        if (send_mode == SEND_SIGNUP_API) {
+            find_json_text(body, "error", error, sizeof(error));
+            collect_field_errors(body, details, sizeof(details));
+            /* A proxy in front of the service may answer with HTML instead. */
+            if (!error[0]) {
+                keep_printable(body);
+                lstrcpynA(error, body, sizeof(error));
+            }
+        } else {
+            keep_printable(body);
+            lstrcpynA(error, body, sizeof(error));
+        }
+        if (error[0]) {
             lstrcatA(result_text, ": ");
-            lstrcatA(result_text, body);
+            lstrcatA(result_text, error);
+        }
+        if (details[0]) {
+            lstrcatA(result_text, "\n");
+            lstrcatA(result_text, details);
         }
     }
 done:
@@ -701,16 +922,29 @@ static DWORD WINAPI send_thread(void *parameter)
 {
     int ok;
     (void)parameter;
-    ok = post_to_slack();
+    ok = post_signup();
     if (main_window) PostMessageA(main_window, WM_APP_SEND_DONE, (WPARAM)ok, 0);
     return 0;
 }
 
-static int load_webhook_url(void)
+static void trim_url(char *text)
+{
+    int i, end;
+    for (i = 0; text[i] == ' ' || text[i] == '\t'; ++i)
+        ;
+    if (i) lstrcpyA(text, text + i);
+    end = lstrlenA(text);
+    while (end > 0 && (text[end - 1] == ' ' || text[end - 1] == '\t' ||
+            text[end - 1] == '\r' || text[end - 1] == '\n'))
+        text[--end] = '\0';
+}
+
+static int load_urls(void)
 {
     char path[MAX_PATH];
     DWORD length = GetModuleFileNameA(NULL, path, sizeof(path));
-    int i, cut = -1, end;
+    int i, cut = -1;
+    endpoint_url[0] = '\0';
     webhook_url[0] = '\0';
     if (length == 0 || length >= sizeof(path)) return 0;
     for (i = 0; path[i]; ++i)
@@ -719,31 +953,34 @@ static int load_webhook_url(void)
     path[cut + 1] = '\0';
     if (lstrlenA(path) + lstrlenA(CONFIG_FILE) >= (int)sizeof(path)) return 0;
     lstrcatA(path, CONFIG_FILE);
+    GetPrivateProfileStringA("signup", "url", "", endpoint_url,
+        sizeof(endpoint_url), path);
     GetPrivateProfileStringA("slack", "url", "", webhook_url,
         sizeof(webhook_url), path);
-    for (i = 0; webhook_url[i] == ' ' || webhook_url[i] == '\t'; ++i)
-        ;
-    if (i) lstrcpyA(webhook_url, webhook_url + i);
-    end = lstrlenA(webhook_url);
-    while (end > 0 && (webhook_url[end - 1] == ' ' || webhook_url[end - 1] == '\t' ||
-            webhook_url[end - 1] == '\r' || webhook_url[end - 1] == '\n'))
-        webhook_url[--end] = '\0';
-    return webhook_url[0] != '\0';
+    trim_url(endpoint_url);
+    trim_url(webhook_url);
+    return endpoint_url[0] != '\0' || webhook_url[0] != '\0';
 }
 
 static void start_send(void)
 {
     HANDLE thread;
     DWORD thread_id;
-    if (!load_webhook_url()) {
-        SetWindowTextA(status_text, "Ingen webhook fundet i HAL9K.INI.");
+    int built;
+    if (!load_urls()) {
+        SetWindowTextA(status_text,
+            "Ingen adresse fundet i HAL9K.INI ([signup] url).");
         return;
     }
+    /* The signup service is the documented path; the direct Slack webhook is
+       kept for existing installations and for relays that only speak Slack. */
+    send_mode = endpoint_url[0] ? SEND_SIGNUP_API : SEND_SLACK;
     if (MessageBoxA(main_window,
             "Oplysningerne sendes til foreningen. Forts\346t?",
             "Send indmeldelse", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
         return;
-    if (!build_payload()) {
+    built = send_mode == SEND_SIGNUP_API ? build_api_payload() : build_slack_payload();
+    if (!built) {
         SetWindowTextA(status_text, "Oplysningerne er for store til at sende.");
         return;
     }
@@ -889,7 +1126,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             apply_state(STATE_SENT, line);
             show_sent_dialog();
         } else {
-            char text[400];
+            char text[900];
             lstrcpyA(text, result_text);
             lstrcatA(text, "\n\nOplysningerne er stadig i formularen."
                 " Kontroller HAL9K.INI og pr\370v igen.");

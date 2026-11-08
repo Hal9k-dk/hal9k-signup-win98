@@ -48,9 +48,11 @@ classic dialog. Each mnemonic applies to the wizard page that holds the field.
 
 ## Posting a signup
 
-Copy `HAL9K.INI.example` to `HAL9K.INI` next to `HAL9K.EXE` (the same folder
-as the executable, also when running it from a CD) and fill in where the
-signup should go. The signup service is the normal choice:
+Copy `HAL9K.INI.example` to `HAL9K.INI` next to `HAL9K.EXE` — the same folder
+as the executable, also on a CD — and fill in where the signup should go. The
+file is looked up beside the executable, so `make hal9k.iso` folds it into the
+CD image when it is present (see [Build](#build)). The signup service is the
+normal choice:
 
 ```ini
 [signup]
@@ -266,8 +268,12 @@ To build a CD image as well (requires `xorriso`):
 make hal9k.iso
 ```
 
-The ISO contains `HAL9K.EXE` and `AUTORUN.INF`; `HAL9K.INI` is not included,
-so add it yourself if the CD should send signups. Mount it as a CD in a
+The ISO contains `HAL9K.EXE` and `AUTORUN.INF`, plus `HAL9K.INI` when that
+file exists in the folder — a CD image built next to a filled-in configuration
+therefore sends signups without further steps. Its address is a credential,
+so keep such an image to yourself instead of publishing it. Without
+`HAL9K.INI` the image is built without it and the form stays offline; the
+recipe says which of the two it did. Mount the image as a CD in a
 Windows 98 virtual machine or burn it to a CD. AutoRun depends on Windows
 and drive settings; if it does not start, open `HAL9K.EXE` manually. The ISO
 is not bootable. `make clean` removes the generated executable, resource

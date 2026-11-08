@@ -77,10 +77,12 @@ git-ignored, so do not commit it or paste it into a screenshot.
 
 The last page's **Send indmeldelse** button validates the whole form, asks for
 confirmation, and then posts it. The request runs on a worker thread, so a
-slow connection does not freeze the window. The status line reports the
-outcome: `Indmeldelse sendt.` or a WinINet error code such as
-`Kunne ikke sende indmeldelsen. Fejl 12175`. A rejected signup is reported with
-the service's own explanation and the fields it objected to, for example:
+slow connection does not freeze the window, and the status line counts the
+seconds it is taking (see [Diagnostics and timeouts](#diagnostics-and-timeouts)).
+The status line reports the outcome: `Indmeldelse sendt.` or a WinINet error
+code such as `Kunne ikke sende indmeldelsen. Fejl 12175`. A rejected signup is
+reported with the service's own explanation and the fields it objected to, for
+example:
 
 ```
 Serveren svarede HTTP 422: Kontrollér felterne.
@@ -91,6 +93,42 @@ Other responses (`HTTP 400`, `HTTP 415`, `HTTP 502`) show the service's
 message, while a Slack webhook error shows its short reply such as
 `Serveren svarede HTTP 400: invalid_payload`. On a successful send the result
 dialog also repeats the receipt returned by the signup service.
+
+### Diagnostics and timeouts
+
+A send always ends. WinINet is given a 30-second timeout for connecting,
+sending and receiving, connection retries are turned off, and a watchdog gives
+the whole attempt 120 seconds. While the request runs the status line names
+the step it is on and counts the seconds:
+
+```
+Sender indmeldelse ... (sender data og venter på svar, 12 s)
+```
+
+Without an answer before the deadline the form returns to **editing** with the
+values intact, the status line names the step that stopped, and a dialog says
+so and points at the log file. A late answer from that attempt is discarded, so
+it cannot overwrite the result of a later one, and **Annuller** stays available
+throughout: closing the window ends the process and with it the blocked
+request.
+
+Every run appends to `HAL9K.LOG` next to `HAL9K.EXE`, or in the temp folder
+when that folder is read-only (on a CD). A line is written *before* and
+*after* each WinINet call and flushed immediately, so when a send hangs the
+last line names the call that blocked:
+
+```
+[12:13:51] attempt: mode=signup-api host=signup.hal9k.dk port=443 secure=1 path=/api/signup payload=272 bytes
+[12:13:51] step: connecting to the host
+[12:13:51] InternetConnectA ok after 12 ms
+[12:13:51] step: sending the request and waiting for the response
+[12:14:11] HttpSendRequestA failed: error 12029 (cannot connect) after 20001 ms
+```
+
+The log records hosts, ports, timings, error codes and the server's own reply,
+but never the signup fields, and for a Slack webhook not the path either,
+because the webhook URL is the credential. When a send fails, include the log
+when reporting it.
 
 ### Wizard pages
 
@@ -116,9 +154,11 @@ hidden pages. Mnemonics still work, but only for fields on the visible page.
 The window has three states, which control what can be edited:
 
 - **Editing** — the initial state; every field and button is enabled.
-- **Sending** — started by confirming the prompt. All fields, both membership
-  options and both buttons are disabled, the send button reads `Sender ...`,
-  and the title bar reads `hal9k - Indmeldelse (sender)`.
+- **Sending** — started by confirming the prompt. Every field, both membership
+  options and both navigation buttons are disabled, the send button reads
+  `Sender ...`, the status line names the current step and the seconds spent,
+  and the title bar reads `hal9k - Indmeldelse (sender)`. `Annuller` stays
+  available so a stuck request cannot trap the user.
 - **Sent** — reached only on success. The form stays disabled on purpose:
   there is nothing left to resend, the finish button reads `Sendt`, the
   navigation buttons are disabled, `Annuller` becomes `Luk`, and the title bar
@@ -181,9 +221,10 @@ that test data was loaded.
 
 `signup.hal9k.dk` and Slack both require TLS 1.2 or newer. Windows 98's
 WinINet/schannel stops at TLS 1.0, so posting straight to either fails there
-with a connection or certificate error. On Windows 95/98/Me, point the URL at
-an internal plain-HTTP relay that forwards over TLS instead, for example an
-nginx location:
+with a connection or certificate error — usually error 12175, reported in the
+status line and in `HAL9K.LOG` as a secure channel failure. On Windows
+95/98/Me, point the URL at an internal plain-HTTP relay that forwards over TLS
+instead, for example an nginx location:
 
 ```nginx
 location /signup/api/ {

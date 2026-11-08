@@ -18,8 +18,11 @@
 #define ID_NEXT 112
 #define ID_CANCEL 113
 
-/* Posted by the send thread once the webhook request has finished. */
+/* Posted by the send thread: the step it is working on, and the result once
+   the request has finished. The result carries the generation of the attempt
+   it belongs to, so a late answer to an abandoned attempt is ignored. */
 #define WM_APP_SEND_DONE (WM_APP + 1)
+#define WM_APP_SEND_STEP (WM_APP + 2)
 
 /* Danish strings are encoded explicitly as Windows-1252 for Windows 98. */
 static HINSTANCE instance;
@@ -47,6 +50,15 @@ static void start_send(void);
 #define STATE_SENDING 1
 #define STATE_SENT 2
 static int form_state = STATE_EDITING;
+
+/* Send bookkeeping, all on the UI thread: the attempt's generation, which of
+   the five steps the worker last reported, when the attempt started, and
+   whether a worker is still running. A blocked worker cannot be cancelled, so
+   the watchdog may give up on its generation while it lingers. */
+static int send_generation;
+static int send_step;
+static DWORD send_started;
+static volatile LONG send_busy;
 
 /* Classic wizard: one page of controls is visible at a time. */
 #define PAGE_INTRO 1
@@ -281,8 +293,9 @@ static void sync_controls(const char *status)
     EnableWindow(back_button, editing && current_page > PAGE_INTRO);
     EnableWindow(next_button, editing);
     /* Cancel stays available while sending so a stuck request cannot trap
-       the user; after success it becomes the way to close the window. */
-    EnableWindow(cancel_button, form_state != STATE_SENDING);
+       the user: closing the window ends the process and with it the worker.
+       After success it becomes the way to close the window. */
+    EnableWindow(cancel_button, TRUE);
     SetWindowTextA(next_button, form_state == STATE_SENDING ? "Sender ..." :
         form_state == STATE_SENT ? "Sendt" :
         current_page == PAGE_MESSAGE ? "Send indmeldelse" : "N\346ste >");
@@ -413,6 +426,25 @@ static void show_sent_dialog(void)
 #define BODY_MAX 1024
 #define HOST_MAX 128
 #define URL_PATH_MAX 512
+
+/* A send must always end, also on a Windows 98 machine where a broken relay,
+   a dial-up line or a proxy prompt can leave a WinINet call blocked: those
+   calls have no default deadline worth waiting for, and a blocked call cannot
+   be cancelled from the outside. Each attempt therefore sets short timeouts
+   and is watched by a timer that gives up after SEND_DEADLINE_MS. */
+#define CONNECT_TIMEOUT_MS 30000
+#define SEND_TIMEOUT_MS 30000
+#define RECEIVE_TIMEOUT_MS 30000
+#define SEND_DEADLINE_MS 120000
+#define ID_TIMER_SEND 1
+
+/* The send thread reports which call it is inside, so the status line and the
+   log name the step a stuck attempt stopped at. */
+#define STEP_OPENING 1
+#define STEP_CONNECTING 2
+#define STEP_REQUESTING 3
+#define STEP_SENDING 4
+#define STEP_RECEIVING 5
 
 /* The signup service speaks the documented JSON contract; a Slack incoming
    webhook takes one mrkdwn message instead. */
@@ -829,6 +861,188 @@ static void collect_field_errors(const char *body, char *out, int size)
     out[length < size ? length : size - 1] = '\0';
 }
 
+/* --- Diagnostics ---------------------------------------------------------
+   A send runs on a worker thread and shows nothing but the status line, and
+   a Windows 98 machine is awkward to debug from, so every attempt writes a
+   timestamped line to HAL9K.LOG *before* each WinINet call and again when it
+   returns. The last line of an interrupted log therefore names the call that
+   blocked. The log records hosts, ports, timings and error codes only: never
+   the signup fields, and never the configured address, whose path can hold a
+   Slack webhook token. */
+
+#define LOG_FILE "HAL9K.LOG"
+#define LOG_LINE_MAX 512
+
+static char log_path[MAX_PATH];
+static HANDLE log_file = INVALID_HANDLE_VALUE;
+
+static void close_log(void)
+{
+    if (log_file != INVALID_HANDLE_VALUE) {
+        CloseHandle(log_file);
+        log_file = INVALID_HANDLE_VALUE;
+    }
+}
+
+/* Prefer the folder of the executable so the log travels with the program,
+   and fall back to the temp folder because a CD is read-only. */
+static void open_log_file(void)
+{
+    char path[MAX_PATH];
+    DWORD length;
+    int i, cut = -1;
+    log_path[0] = '\0';
+    length = GetModuleFileNameA(NULL, path, sizeof(path));
+    if (length > 0 && length < sizeof(path)) {
+        for (i = 0; path[i]; ++i)
+            if (path[i] == '\\' || path[i] == '/') cut = i;
+        if (cut >= 0 && cut + 1 + (int)sizeof(LOG_FILE) < (int)sizeof(path)) {
+            path[cut + 1] = '\0';
+            lstrcatA(path, LOG_FILE);
+            log_file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ,
+                NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (log_file != INVALID_HANDLE_VALUE) lstrcpyA(log_path, path);
+        }
+    }
+    if (log_file == INVALID_HANDLE_VALUE) {
+        char folder[MAX_PATH];
+        if (!GetTempPathA(sizeof(folder), folder)) return;
+        if (lstrlenA(folder) + lstrlenA(LOG_FILE) >= (int)sizeof(folder))
+            return;
+        lstrcatA(folder, LOG_FILE);
+        log_file = CreateFileA(folder, GENERIC_WRITE, FILE_SHARE_READ,
+            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (log_file != INVALID_HANDLE_VALUE) lstrcpyA(log_path, folder);
+    }
+}
+
+/* Written line by line and flushed at once, so a line survives a killed
+   process: that is what makes the last line useful on a hung send. */
+static void log_event(const char *format, ...)
+{
+    char line[LOG_LINE_MAX];
+    char clock[12];
+    SYSTEMTIME now;
+    va_list args;
+    DWORD written;
+    int length;
+    if (log_file == INVALID_HANDLE_VALUE) return;
+    GetLocalTime(&now);
+    clock[0] = (char)('0' + (now.wHour / 10) % 10);
+    clock[1] = (char)('0' + now.wHour % 10);
+    clock[2] = ':';
+    clock[3] = (char)('0' + (now.wMinute / 10) % 10);
+    clock[4] = (char)('0' + now.wMinute % 10);
+    clock[5] = ':';
+    clock[6] = (char)('0' + (now.wSecond / 10) % 10);
+    clock[7] = (char)('0' + now.wSecond % 10);
+    clock[8] = '\0';
+    line[0] = '[';
+    lstrcpynA(line + 1, clock, LOG_LINE_MAX - 1);
+    length = 1 + lstrlenA(clock);
+    line[length++] = ']';
+    line[length++] = ' ';
+    line[length] = '\0';
+    va_start(args, format);
+    wvsprintfA(line + length, format, args);
+    va_end(args);
+    length = lstrlenA(line);
+    if (length > LOG_LINE_MAX - 3) length = LOG_LINE_MAX - 3;
+    line[length++] = '\r';
+    line[length++] = '\n';
+    line[length] = '\0';
+    SetFilePointer(log_file, 0, NULL, FILE_END);
+    WriteFile(log_file, line, (DWORD)length, &written, NULL);
+    FlushFileBuffers(log_file);
+}
+
+/* WinINet reports a failure as a bare number; the name is what makes the log
+   readable for whoever is looking at it later. */
+#ifndef ERROR_INTERNET_SECURE_FAILURE
+#define ERROR_INTERNET_SECURE_FAILURE 12175   /* schannel could not agree TLS */
+#endif
+
+static const char *wininet_error_name(DWORD error)
+{
+    switch (error) {
+    case ERROR_INTERNET_TIMEOUT: return "timeout";
+    case ERROR_INTERNET_NAME_NOT_RESOLVED: return "name not resolved";
+    case ERROR_INTERNET_CANNOT_CONNECT: return "cannot connect";
+    case ERROR_INTERNET_CONNECTION_ABORTED: return "connection aborted";
+    case ERROR_INTERNET_CONNECTION_RESET: return "connection reset";
+    case ERROR_INTERNET_OPERATION_CANCELLED: return "operation cancelled";
+    case ERROR_INTERNET_SECURE_FAILURE: return "secure channel failure";
+    case ERROR_INTERNET_INVALID_CA: return "unknown certificate authority";
+    case ERROR_INTERNET_UNRECOGNIZED_SCHEME: return "unrecognized URL scheme";
+    case ERROR_INTERNET_PROXY_SERVER_UNREACHABLE: return "proxy unreachable";
+    case ERROR_INTERNET_SERVER_UNREACHABLE: return "server unreachable";
+    case ERROR_INTERNET_INVALID_URL: return "invalid URL";
+    case ERROR_INTERNET_INVALID_OPERATION: return "invalid operation";
+    case ERROR_INTERNET_ITEM_NOT_FOUND: return "item not found";
+    default: return "see the WinINet error list";
+    }
+}
+
+/* Note the failing call with its error code, the time it took and, when the
+   server or a proxy said anything, that text as well. */
+static void log_call_failure(const char *call, DWORD error, DWORD elapsed)
+{
+    char server[256];
+    DWORD ignored = 0, size = sizeof(server);
+    server[0] = '\0';
+    if (InternetGetLastResponseInfoA(&ignored, server, &size))
+        keep_printable(server);
+    log_event("%s failed: error %u (%s) after %u ms%s%s", call, (unsigned)error,
+        wininet_error_name(error), (unsigned)elapsed,
+        server[0] ? "; server replied: " : "", server);
+}
+
+/* Named so the status line and the log say where a send is, and where it
+   stopped when it does not return. */
+static const char *step_name(int step)
+{
+    switch (step) {
+    case STEP_CONNECTING: return "connecting to the host";
+    case STEP_REQUESTING: return "opening the HTTP request";
+    case STEP_SENDING: return "sending the request and waiting for the response";
+    case STEP_RECEIVING: return "reading the response";
+    default: return "opening the WinINet session";
+    }
+}
+
+static void report_step(int step)
+{
+    log_event("step: %s", step_name(step));
+    if (main_window) PostMessageA(main_window, WM_APP_SEND_STEP, (WPARAM)step, 0);
+}
+
+/* Short timeouts on the session handle apply to every request made from it.
+   Without them WinINet waits for its defaults, which on Windows 98 can be
+   minutes per attempt and are multiplied by connection retries. */
+static void set_timeouts(HINTERNET session)
+{
+    DWORD value;
+    value = CONNECT_TIMEOUT_MS;
+    if (!InternetSetOptionA(session, INTERNET_OPTION_CONNECT_TIMEOUT,
+            &value, sizeof(value)))
+        log_event("could not set connect timeout: error %u", (unsigned)GetLastError());
+    value = SEND_TIMEOUT_MS;
+    if (!InternetSetOptionA(session, INTERNET_OPTION_SEND_TIMEOUT,
+            &value, sizeof(value)))
+        log_event("could not set send timeout: error %u", (unsigned)GetLastError());
+    value = RECEIVE_TIMEOUT_MS;
+    if (!InternetSetOptionA(session, INTERNET_OPTION_RECEIVE_TIMEOUT,
+            &value, sizeof(value)))
+        log_event("could not set receive timeout: error %u", (unsigned)GetLastError());
+    value = 0;
+    if (!InternetSetOptionA(session, INTERNET_OPTION_CONNECT_RETRIES,
+            &value, sizeof(value)))
+        log_event("could not turn off connect retries: error %u", (unsigned)GetLastError());
+    log_event("timeouts: connect %u ms, send %u ms, receive %u ms, no retries",
+        (unsigned)CONNECT_TIMEOUT_MS, (unsigned)SEND_TIMEOUT_MS,
+        (unsigned)RECEIVE_TIMEOUT_MS);
+}
+
 static int post_signup(void)
 {
     char host[HOST_MAX], path[URL_PATH_MAX], body[BODY_MAX];
@@ -836,48 +1050,86 @@ static int post_signup(void)
     unsigned short port = 0;
     int secure = 0, ok = 0;
     DWORD flags, status = 0, size = sizeof(status);
+    DWORD started = GetTickCount(), call_started;
     HINTERNET session = NULL, connection = NULL, request = NULL;
 
     if (!split_url(url, host, sizeof(host), &port, &secure,
             path, sizeof(path))) {
         lstrcpyA(result_text, "Adressen i HAL9K.INI er ugyldig.");
+        log_event("the configured address could not be read; nothing sent");
         return 0;
     }
+    /* The path is left out of the log for the webhook, where it is the
+       credential; the signup service path is not a secret and is useful. */
+    log_event("attempt: mode=%s host=%s port=%u secure=%d path=%s payload=%u bytes",
+        send_mode == SEND_SLACK ? "slack-webhook" : "signup-api",
+        host, (unsigned)port, secure,
+        send_mode == SEND_SLACK ? "(redacted)" : path,
+        (unsigned)payload_length);
+    report_step(STEP_OPENING);
+    call_started = GetTickCount();
     session = InternetOpenA("hal9k-signup/1.0", INTERNET_OPEN_TYPE_PRECONFIG,
         NULL, NULL, 0);
     if (!session) {
+        log_call_failure("InternetOpenA", GetLastError(),
+            GetTickCount() - call_started);
         set_result_number("Kunne ikke starte netv\346rk. Fejl ", GetLastError());
         return 0;
     }
+    log_event("InternetOpenA ok after %u ms", (unsigned)(GetTickCount() - call_started));
+    set_timeouts(session);
+    report_step(STEP_CONNECTING);
+    call_started = GetTickCount();
     connection = InternetConnectA(session, host, port, NULL, NULL,
         INTERNET_SERVICE_HTTP, 0, 0);
     if (!connection) {
+        log_call_failure("InternetConnectA", GetLastError(),
+            GetTickCount() - call_started);
         set_result_number("Kunne ikke kontakte v\346rten. Fejl ", GetLastError());
         goto done;
     }
-    flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE;
+    log_event("InternetConnectA ok after %u ms", (unsigned)(GetTickCount() - call_started));
+    /* INTERNET_FLAG_NO_UI keeps a proxy or dial-up prompt out of the worker
+       thread, where it could wait behind the form for an answer nobody sees. */
+    flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE |
+        INTERNET_FLAG_NO_UI;
     if (secure) flags |= INTERNET_FLAG_SECURE;
+    report_step(STEP_REQUESTING);
+    call_started = GetTickCount();
     request = HttpOpenRequestA(connection, "POST", path, NULL, NULL, NULL,
         flags, 0);
     if (!request) {
+        log_call_failure("HttpOpenRequestA", GetLastError(),
+            GetTickCount() - call_started);
         set_result_number("Kunne ikke oprette anmodning. Fejl ", GetLastError());
         goto done;
     }
+    report_step(STEP_SENDING);
+    call_started = GetTickCount();
     if (!HttpSendRequestA(request, "Content-Type: application/json\r\n", -1,
             payload, (DWORD)payload_length)) {
+        log_call_failure("HttpSendRequestA", GetLastError(),
+            GetTickCount() - call_started);
         set_result_number("Kunne ikke sende indmeldelsen. Fejl ", GetLastError());
         goto done;
     }
+    log_event("HttpSendRequestA ok after %u ms", (unsigned)(GetTickCount() - call_started));
+    report_step(STEP_RECEIVING);
     if (!HttpQueryInfoA(request, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
             &status, &size, NULL)) {
+        log_call_failure("HttpQueryInfoA", GetLastError(),
+            GetTickCount() - call_started);
         set_result_number("Ukendt svar fra serveren. Fejl ", GetLastError());
         goto done;
     }
+    log_event("server answered HTTP %u after %u ms", (unsigned)status,
+        (unsigned)(GetTickCount() - started));
     if (status == 200) {
         lstrcpyA(result_text, "Indmeldelse sendt.");
         server_message[0] = '\0';
         if (send_mode == SEND_SIGNUP_API) {
             read_response_body(request, body, sizeof(body));
+            log_event("response body: %u bytes", (unsigned)lstrlenA(body));
             find_json_text(body, "message", server_message,
                 sizeof(server_message));
         }
@@ -915,15 +1167,20 @@ done:
     if (request) InternetCloseHandle(request);
     if (connection) InternetCloseHandle(connection);
     InternetCloseHandle(session);
+    log_event("attempt finished: ok=%d total %u ms", ok,
+        (unsigned)(GetTickCount() - started));
     return ok;
 }
 
 static DWORD WINAPI send_thread(void *parameter)
 {
-    int ok;
-    (void)parameter;
+    int ok, generation = (int)(INT_PTR)parameter;
     ok = post_signup();
-    if (main_window) PostMessageA(main_window, WM_APP_SEND_DONE, (WPARAM)ok, 0);
+    /* Post first, then stop being busy: the UI may discard this completion,
+       but it must never start a new send while this thread still runs. */
+    if (main_window)
+        PostMessageA(main_window, WM_APP_SEND_DONE, (WPARAM)ok, (LPARAM)generation);
+    InterlockedExchange(&send_busy, 0);
     return 0;
 }
 
@@ -953,61 +1210,143 @@ static int load_urls(void)
     path[cut + 1] = '\0';
     if (lstrlenA(path) + lstrlenA(CONFIG_FILE) >= (int)sizeof(path)) return 0;
     lstrcatA(path, CONFIG_FILE);
+    log_event("configuration file: %s", path);
     GetPrivateProfileStringA("signup", "url", "", endpoint_url,
         sizeof(endpoint_url), path);
     GetPrivateProfileStringA("slack", "url", "", webhook_url,
         sizeof(webhook_url), path);
     trim_url(endpoint_url);
     trim_url(webhook_url);
+    if (GetFileAttributesA(path) == 0xFFFFFFFF)   /* INVALID_FILE_ATTRIBUTES */
+        log_event("configuration file not found; nothing to send to");
     return endpoint_url[0] != '\0' || webhook_url[0] != '\0';
+}
+
+/* The status line is the only sign of life during a send, so it names the
+   step and counts the seconds. A send that never returns is visible instead
+   of looking like an idle window. */
+static const char *step_label(int step)
+{
+    switch (step) {
+    case STEP_CONNECTING: return "kontakter v\346rten";
+    case STEP_REQUESTING: return "opretter anmodning";
+    case STEP_SENDING: return "sender data og venter p\345 svar";
+    case STEP_RECEIVING: return "l\346ser svaret";
+    default: return "starter netv\346rk";
+    }
+}
+
+static void update_send_status(void)
+{
+    char text[160];
+    DWORD elapsed = GetTickCount() - send_started;
+    wsprintfA(text, "Sender indmeldelse ... (%s, %u s)", step_label(send_step),
+        (unsigned)(elapsed / 1000));
+    SetWindowTextA(status_text, text);
+}
+
+/* The watchdog. A WinINet call that blocks cannot be cancelled from outside,
+   so the form stops waiting on it: the attempt is logged with the step it
+   stopped at, the fields become editable again, and the late completion is
+   discarded because its generation no longer matches. */
+static void abandon_send(void)
+{
+    char text[512];
+    DWORD elapsed = GetTickCount() - send_started;
+    KillTimer(main_window, ID_TIMER_SEND);
+    log_event("watchdog: attempt %d got no answer after %u ms while %s; giving up",
+        send_generation, (unsigned)elapsed, step_name(send_step));
+    ++send_generation;
+    wsprintfA(result_text, "Afsendelsen svarede ikke inden for %u sekunder.",
+        (unsigned)(SEND_DEADLINE_MS / 1000));
+    apply_state(STATE_EDITING, result_text);
+    wsprintfA(text, "Der kom intet svar inden for %u sekunder.\n\n"
+        "Sidste trin: %s.\n\nOplysningerne st\345r stadig i formularen. "
+        "Kontroller HAL9K.INI og forbindelsen, og pr\370v igen.",
+        (unsigned)(SEND_DEADLINE_MS / 1000), step_label(send_step));
+    if (log_path[0]) {
+        lstrcatA(text, "\n\nDer er skrevet en logfil:\n");
+        lstrcatA(text, log_path);
+    }
+    MessageBoxA(main_window, text, "Afsendelsen svarede ikke",
+        MB_OK | MB_ICONWARNING);
 }
 
 static void start_send(void)
 {
     HANDLE thread;
     DWORD thread_id;
-    int built;
+    int built, generation;
     if (!load_urls()) {
         SetWindowTextA(status_text,
             "Ingen adresse fundet i HAL9K.INI ([signup] url).");
+        log_event("no [signup] or [slack] url next to the executable; nothing sent");
         return;
     }
     /* The signup service is the documented path; the direct Slack webhook is
        kept for existing installations and for relays that only speak Slack. */
     send_mode = endpoint_url[0] ? SEND_SIGNUP_API : SEND_SLACK;
+    log_event("configuration read; mode=%s",
+        send_mode == SEND_SIGNUP_API ? "signup-api" : "slack-webhook");
+    /* A worker that the watchdog gave up on may still be inside a WinINet
+       call. It shares the payload buffer, so a second one has to wait. */
+    if (send_busy) {
+        SetWindowTextA(status_text,
+            "Den forrige afsendelse er stadig i gang. Vent eller luk vinduet.");
+        log_event("send refused: the previous attempt has not returned yet");
+        return;
+    }
     if (MessageBoxA(main_window,
             "Oplysningerne sendes til foreningen. Forts\346t?",
-            "Send indmeldelse", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+            "Send indmeldelse", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        log_event("confirmation declined; nothing sent");
         return;
+    }
     built = send_mode == SEND_SIGNUP_API ? build_api_payload() : build_slack_payload();
     if (!built) {
         SetWindowTextA(status_text, "Oplysningerne er for store til at sende.");
+        log_event("payload too large for the buffer; nothing sent");
         return;
     }
     lstrcpyA(result_text, "Ingen afsendelse gennemf\370rt.");
+    ++send_generation;
+    generation = send_generation;
+    send_started = GetTickCount();
+    send_step = STEP_OPENING;
+    InterlockedExchange(&send_busy, 1);
     apply_state(STATE_SENDING, "Sender indmeldelse ...");
-    thread = CreateThread(NULL, 0, send_thread, NULL, 0, &thread_id);
+    update_send_status();
+    if (!SetTimer(main_window, ID_TIMER_SEND, 1000, NULL))
+        log_event("SetTimer failed: error %u; this attempt has no watchdog",
+            (unsigned)GetLastError());
+    log_event("attempt %d started", generation);
+    thread = CreateThread(NULL, 0, send_thread, (void *)(INT_PTR)generation, 0,
+        &thread_id);
     if (!thread) {
+        InterlockedExchange(&send_busy, 0);
+        KillTimer(main_window, ID_TIMER_SEND);
+        log_event("CreateThread failed: error %u", (unsigned)GetLastError());
         apply_state(STATE_EDITING, "Kunne ikke starte afsendelsen.");
         return;
     }
     CloseHandle(thread);
 }
 
-/* Wizard keys: Enter advances or finishes, Escape cancels. Enter inside the
-   optional message still inserts a newline. */
+/* Wizard keys: Enter advances or finishes, Escape asks to close. Enter inside
+   the optional message still inserts a newline. Escape also works while a
+   send is running, where closing asks for confirmation first. */
 static BOOL handle_wizard_keys(HWND window, const MSG *message)
 {
-    if (form_state != STATE_EDITING) return FALSE;
     if (message->message != WM_KEYDOWN) return FALSE;
     if (message->hwnd != window && !IsChild(window, message->hwnd)) return FALSE;
+    if (message->wParam == VK_ESCAPE) {
+        PostMessageA(window, WM_CLOSE, 0, 0);
+        return TRUE;
+    }
+    if (form_state != STATE_EDITING) return FALSE;
     if (message->wParam == VK_RETURN) {
         if (GetFocus() == message_field) return FALSE;
         go_next();
-        return TRUE;
-    }
-    if (message->wParam == VK_ESCAPE) {
-        PostMessageA(window, WM_CLOSE, 0, 0);
         return TRUE;
     }
     return FALSE;
@@ -1018,7 +1357,16 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
     switch (message) {
     case WM_CREATE: {
         char text[64];
+        OSVERSIONINFOA version;
         main_window = window;
+        open_log_file();
+        log_event("hal9k-signup started, built %s %s", __DATE__, __TIME__);
+        if (log_path[0]) log_event("log file: %s", log_path);
+        version.dwOSVersionInfoSize = sizeof(version);
+        if (GetVersionExA(&version))
+            log_event("Windows %u.%u.%u", (unsigned)version.dwMajorVersion,
+                (unsigned)version.dwMinorVersion,
+                (unsigned)version.dwBuildNumber);
         font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
         header_font = CreateFontA(-13, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
@@ -1116,7 +1464,30 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             return 0;
         }
         break;
+    case WM_TIMER:
+        if (wparam == ID_TIMER_SEND && form_state == STATE_SENDING) {
+            if (GetTickCount() - send_started >= SEND_DEADLINE_MS)
+                abandon_send();
+            else
+                update_send_status();
+            return 0;
+        }
+        break;
+    case WM_APP_SEND_STEP:
+        if (form_state == STATE_SENDING) {
+            send_step = (int)wparam;
+            update_send_status();
+        }
+        return 0;
     case WM_APP_SEND_DONE:
+        /* A completion that belongs to an attempt the watchdog abandoned is
+           stale: its result is no longer what the form is waiting for. */
+        if ((int)lparam != send_generation) {
+            log_event("late completion for attempt %d ignored; watching attempt %d",
+                (int)lparam, send_generation);
+            return 0;
+        }
+        KillTimer(window, ID_TIMER_SEND);
         if (wparam) {
             char time_text[8], line[96];
             format_time(time_text, sizeof(time_text));
@@ -1135,7 +1506,18 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
                 MB_OK | MB_ICONWARNING);
         }
         return 0;
+    case WM_CLOSE:
+        /* Closing ends the process, and with it a worker that is still
+           blocked, so ask first while a send is running. */
+        if (form_state == STATE_SENDING &&
+            MessageBoxA(window, "Indmeldelsen er ikke sendt f\346rdig. Luk alligevel?",
+                "Luk hal9k", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+            return 0;
+        log_event("window closed in state %d", form_state);
+        DestroyWindow(window);
+        return 0;
     case WM_DESTROY:
+        close_log();
         PostQuitMessage(0);
         return 0;
     }

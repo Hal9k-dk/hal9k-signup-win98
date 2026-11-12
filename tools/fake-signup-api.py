@@ -31,7 +31,7 @@ MAX_BODY = 16 << 10
 
 PERSONAL = ("firstName", "lastName", "email", "street",
             "postalCode", "city", "birthDate", "phone")
-PROPERTIES = PERSONAL + ("membership", "message")
+PROPERTIES = PERSONAL + ("membership", "message", "experience")
 
 LABELS = {
     "firstName": "Fornavn",
@@ -44,6 +44,7 @@ LABELS = {
     "phone": "Telefon nr.",
     "membership": "Medlemsskab",
     "message": "Besked",
+    "experience": "Experience",
 }
 
 EMAIL = re.compile(r"[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+")
@@ -54,7 +55,7 @@ slack_failing = False
 
 
 def validate(data):
-    """Mirror api/signup.go: every personal field, plus membership and message."""
+    """Validate personal fields, membership and optional message/experience."""
     errors = {}
     for key in PROPERTIES:
         value = data.get(key, "")
@@ -64,6 +65,10 @@ def validate(data):
         if key == "message":
             if len(value.encode("utf-8")) > MAX_MESSAGE:
                 errors[key] = "Beskeden må højst fylde 4000 bytes."
+            continue
+        if key == "experience":
+            if len(value.encode("utf-8")) > MAX_FIELD:
+                errors[key] = "Brug højst 256 tegn."
             continue
         if key == "membership":
             if value not in ("ordinary", "student"):

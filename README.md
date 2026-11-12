@@ -63,8 +63,10 @@ That is the service deployed from the drillpress repository. It accepts one
 JSON object, checks every field again and forwards the signup to hal9k. The
 wizard sends the documented v1 contract — `firstName`, `lastName`, `email`,
 `street`, `postalCode`, `city`, `birthDate`, `phone`, `membership` (`ordinary`
-or `student`) and the optional `message` — with the values as typed, so the
-service receives the text itself rather than Slack markup.
+or `student`), the optional `message`, and `experience` set to
+`hal9k-signup-win98`. User-entered values are sent as typed, so the service
+receives the text itself rather than Slack markup. The direct Slack path also
+includes the experience identifier in its message.
 
 Alternatively the fields can be posted straight to a Slack incoming webhook:
 
@@ -94,7 +96,10 @@ Fødselsdato: Brug en gyldig fødselsdato i formatet dd-mm-yyyy.
 Other responses (`HTTP 400`, `HTTP 415`, `HTTP 502`) show the service's
 message, while a Slack webhook error shows its short reply such as
 `Serveren svarede HTTP 400: invalid_payload`. On a successful send the result
-dialog also repeats the receipt returned by the signup service.
+dialog also repeats the receipt returned by the signup service. Successful
+signups play the Windows-installed `Media\tada.wav` asynchronously; failed
+or timed-out attempts do not. If the sound file is missing, success stays
+silent.
 
 ### Diagnostics and timeouts
 

@@ -2,6 +2,7 @@
 #define _WIN32_WINNT 0x0400
 #include <windows.h>
 #include <wininet.h>
+#include <mmsystem.h>
 
 #define ID_FIRST 100
 #define ID_LAST 101
@@ -409,7 +410,20 @@ static void show_sent_dialog(void)
         lstrcatA(text, server_message);
     }
     lstrcatA(text, "\n\nOplysningerne kan ikke sendes igen. Luk vinduet.");
-    MessageBoxA(main_window, text, "Indmeldelse sendt", MB_OK | MB_ICONINFORMATION);
+    /* No default notification sound: let tada.wav finish uninterrupted. */
+    MessageBoxA(main_window, text, "Indmeldelse sendt", MB_OK);
+}
+
+static void play_signup_sound(void)
+{
+    char path[MAX_PATH];
+    UINT length = GetWindowsDirectoryA(path, sizeof(path));
+    if (!length || length >= sizeof(path)) return;
+    if (length + lstrlenA("\\Media\\tada.wav") >= (int)sizeof(path)) return;
+    lstrcatA(path, "\\Media\\tada.wav");
+    /* Use the installed Windows sound, without blocking the UI or beeping
+       if this Windows installation does not include the file. */
+    PlaySoundA(path, NULL, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
 }
 
 /* --- Sending -------------------------------------------------------------
@@ -539,9 +553,9 @@ static int append_json(const char *text, int slack_markup)
     return 1;
 }
 
-/* The v1 contract: one JSON object of strings, every property except message
-   required, unknown properties rejected. Keys are part of that contract, not
-   free-form labels, so they stay camelCase even though the form is Danish. */
+/* The signup contract: one JSON object of strings, with optional message and
+   experience metadata. Keys are part of that contract, not free-form labels,
+   so they stay camelCase even though the form is Danish. */
 static int build_api_payload(void)
 {
     static const char *keys[8] = {
@@ -565,7 +579,7 @@ static int build_api_payload(void)
     if (!append_text(",\"membership\":\"")) return 0;
     if (!append_text(SendMessageA(GetDlgItem(main_window, ID_STUDENT),
             BM_GETCHECK, 0, 0) == BST_CHECKED ? "student" : "ordinary")) return 0;
-    if (!append_text("\",\"message\":\"")) return 0;
+    if (!append_text("\",\"experience\":\"hal9k-signup-win98\",\"message\":\"")) return 0;
     if (!append_json(value, 0)) return 0;
     if (!append_text("\"}")) return 0;
     payload[payload_length] = '\0';
@@ -598,6 +612,7 @@ static int build_slack_payload(void)
     if (!append_json(SendMessageA(GetDlgItem(main_window, ID_STUDENT),
             BM_GETCHECK, 0, 0) == BST_CHECKED ? "Studiemedlem" : "Almindeligt medlem", 1))
         return 0;
+    if (!append_text("\\n*Experience:* hal9k-signup-win98")) return 0;
     if (!append_text("\"}")) return 0;
     payload[payload_length] = '\0';
     return 1;
@@ -1495,6 +1510,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             lstrcatA(line, time_text);
             lstrcatA(line, ". Luk vinduet.");
             apply_state(STATE_SENT, line);
+            play_signup_sound();
             show_sent_dialog();
         } else {
             char text[900];

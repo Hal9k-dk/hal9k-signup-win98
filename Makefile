@@ -10,7 +10,7 @@ hal9k-res.o: hal9k.rc hal9k.ico
 	$(WINDRES) -i hal9k.rc -o $@
 
 hal9k.exe: hal9k.c hal9k-res.o
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -luser32 -lgdi32 -lwininet -lkernel32
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ -luser32 -lgdi32 -lwininet -lwinmm -lkernel32
 
 # HAL9K.INI is git-ignored and holds the signup address; a Slack webhook URL
 # in it is a credential. When the file is present it is folded into the image,
